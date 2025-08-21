@@ -3,6 +3,12 @@
 # NVIDIA KMS, Hyprland (no DM), zram, fstrim.timer, Snapper manual, baseline snapshot.
 # Idempotent: fully wipes target disk on each run. ASCII-only messages.
 
+# Require bash (zsh/sh will fail on process substitution etc.)
+if [[ -z "${BASH_VERSINFO:-}" ]]; then
+  echo "[X] Please run this script with:  bash $0"
+  exit 1
+fi
+
 set -Eeuo pipefail
 
 # Try to make TTY readable on Arch ISO (optional)
@@ -31,7 +37,14 @@ HYPR_MON2="HDMI-A-1, 1920x1080@60, 1920x0, 1"
 
 ts="$(date +%F_%H%M%S)"
 LOG="/tmp/arch_install_${ts}.log"
-exec > >(tee -a "$LOG") 2>&1
+
+# Robust logging: try tee + process substitution; fallback to file-only
+if command -v tee >/dev/null 2>&1 && [[ -r /proc/self/fd/1 ]]; then
+  exec > >(tee -a "$LOG") 2>&1
+else
+  echo "[!] Process substitution not available; logging only to $LOG"
+  exec >>"$LOG" 2>&1
+fi
 
 on_error() { echo "ERROR at line $1. See log: $LOG"; }
 trap 'on_error $LINENO' ERR
@@ -50,7 +63,6 @@ check_uefi() {
 }
 
 prompt_nonempty_secret() {
-  # $1=prompt; prints to stdout the non-empty secret
   local s
   while :; do
     read -rsp "$1" s; echo
@@ -94,8 +106,8 @@ cleanup_previous() {
     [[ -e "/dev/mapper/$map" ]] && cryptsetup close "$map" || true
   done
 
-  (dmsetup remove -f /dev/mapper/root >/dev/null 2>&1) || true
-  (dmsetup remove -f /dev/mapper/home >/dev/null 2>&1) || true
+  (dmsetup remove -f /dev/mapper/root  >/dev/null 2>&1) || true
+  (dmsetup remove -f /dev/mapper/home  >/dev/null 2>&1) || true
 
   if lsblk -ln -o NAME "${DISK}" >/dev/null 2>&1; then
     for p in $(lsblk -ln -o NAME "/dev/$(basename "$DISK")" | tail -n +2); do
@@ -217,4 +229,164 @@ EOF
   in_chroot "ln -sf /usr/share/zoneinfo/${TZ_DEFAULT} /etc/localtime"
   in_chroot "hwclock --systohc"
 
-  # ho
+  # hostname & hosts
+  echo "$HOSTNAME" > /mnt/etc/hostname
+  cat >/mnt/etc/hosts <<EOF
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+EOF
+
+  # mkinitcpio
+  sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_drm tpm tpm_tis btrfs)/' /mnt/etc/mkinitcpio.conf
+  sed -i 's|^BINARIES=.*|BINARIES=(/usr/bin/btrfs)|' /mnt/etc/mkinitcpio.conf
+  sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /mnt/etc/mkinitcpio.conf
+  in_chroot "mkinitcpio -P"
+
+  # NVIDIA KMS
+  mkdir -p /mnt/etc/modprobe.d
+  echo "options nvidia-drm modeset=1" > /mnt/etc/modprobe.d/nvidia.conf
+
+  # systemd-boot
+  in_chroot "bootctl install"
+  cat >/mnt/boot/loader/loader.conf <<'EOF'
+default arch.conf
+timeout 1
+console-mode max
+editor no
+auto-entries yes
+EOF
+  cat >/mnt/boot/loader/entries/arch.conf <<EOF
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /intel-ucode.img
+initrd  /initramfs-linux.img
+options rd.luks.name=${ROOT_UUID}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia_drm.modeset=1
+EOF
+
+  # crypttab (home with discard — TRIM through LUKS)
+  echo "home UUID=${HOME_UUID} none luks,discard" > /mnt/etc/crypttab
+
+  # TRIM weekly
+  in_chroot "systemctl enable fstrim.timer"
+
+  # zram 16G zstd
+  cat >/mnt/etc/systemd/zram-generator.conf <<'EOF'
+[zram0]
+zram-size = 16G
+compression-algorithm = zstd
+EOF
+
+  # network
+  in_chroot "systemctl enable NetworkManager"
+}
+
+configure_snapper() {
+  cecho "Configuring Snapper (manual mode + baseline)..."
+  in_chroot "umount /.snapshots || true; umount /home/.snapshots || true; true"
+  in_chroot "snapper -c root create-config /"
+  in_chroot "snapper -c home create-config /home"
+
+  in_chroot "sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE=\"no\"/' /etc/snapper/configs/root"
+  in_chroot "sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP=\"no\"/' /etc/snapper/configs/root"
+  in_chroot "sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE=\"no\"/' /etc/snapper/configs/home"
+  in_chroot "sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP=\"no\"/' /etc/snapper/configs/home"
+
+  in_chroot "mount -a"
+  in_chroot "snapper -c root create -d 'baseline-0 post-install'"
+}
+
+create_user_env() {
+  cecho "Creating user and Hyprland/WezTerm environment..."
+  in_chroot "pacman -S --noconfirm zsh zsh-completions sudo"
+  in_chroot "useradd -m -G wheel -s /usr/bin/zsh ${USERNAME}"
+  echo "root:${ROOT_PW}" | in_chroot "chpasswd"
+  echo "${USERNAME}:${USER_PW}" | in_chroot "chpasswd"
+  echo "%wheel ALL=(ALL) ALL" >> /mnt/etc/sudoers
+
+  # Autostart Hyprland from tty1
+  in_chroot "install -d -m 0700 /home/${USERNAME}"
+  cat >/mnt/home/${USERNAME}/.zprofile <<'EOF'
+# Autostart Hyprland from tty1 (no display manager)
+if [[ -z "$DISPLAY" && "$(tty)" == "/dev/tty1" ]]; then
+  exec Hyprland
+fi
+EOF
+  in_chroot "chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.zprofile"
+
+  # Hyprland config
+  in_chroot "install -d -m 0700 /home/${USERNAME}/.config/hypr"
+  cat >/mnt/home/${USERNAME}/.config/hypr/hyprland.conf <<EOF
+monitor = ${HYPR_MON1}
+monitor = ${HYPR_MON2}
+workspace = 1, monitor:DP-1
+workspace = 2, monitor:HDMI-A-1
+
+env = XDG_CURRENT_DESKTOP,Hyprland
+env = XDG_SESSION_TYPE,wayland
+env = MOZ_ENABLE_WAYLAND,1
+env = WLR_NO_HARDWARE_CURSORS,0
+
+input {
+  kb_layout = us,ru
+  kb_options = grp:caps_toggle,terminate:ctrl_alt_bksp
+}
+
+exec-once = firefox
+exec-once = wezterm
+EOF
+  in_chroot "chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config"
+
+  # WezTerm config with fallback fonts
+  in_chroot "install -d -m 0700 /home/${USERNAME}/.config/wezterm"
+  cat >/mnt/home/${USERNAME}/.config/wezterm/wezterm.lua <<'EOF'
+local wezterm = require 'wezterm'
+return {
+  enable_wayland = true,
+  font = wezterm.font_with_fallback({
+    "DejaVu Sans Mono",
+    "Symbols Nerd Font Mono",
+  }),
+  color_scheme = "Builtin Tango Dark",
+}
+EOF
+  in_chroot "chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/wezterm"
+}
+
+copy_log_and_finish() {
+  cecho "Copying install log into target system..."
+  mkdir -p /mnt/var/log/installer
+  cp -a "$LOG" /mnt/var/log/installer/
+
+  cecho "Done. You can reboot."
+  cat <<'EOCHECKS'
+Post-boot checks:
+  lsblk
+  bootctl status
+  systemctl status fstrim.timer
+  swapon --show
+  snapper -c root list
+  hyprctl monitors   # adjust monitor names in ~/.config/hypr/hyprland.conf if needed
+EOCHECKS
+}
+
+main() {
+  require_root
+  check_uefi
+  prompt_vars
+  ensure_net
+  cleanup_previous
+  wipe_and_partition
+  format_encrypt
+  create_subvols
+  mount_all
+  pacstrap_base
+  configure_system
+  configure_snapper
+  create_user_env
+  copy_log_and_finish
+
+  wecho "Note: TRIM via weekly fstrim.timer + discard through LUKS (cmdline/crypttab). No discard in fstab."
+}
+
+main "$@"

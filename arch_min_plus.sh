@@ -1,146 +1,383 @@
 #!/usr/bin/env bash
-# Minimal Arch install for ONE PC + fixes:
-# - password confirmation for root/user
-# - keep cryptsetup interactive (LUKS format/open prompts)
-# - pacstrap handling: use --noconfirm when available, otherwise prepopulate keyring
-set -euo pipefail
-if [[ -z "${BASH_VERSINFO:-}" ]]; then echo "[X] Run with: bash $0"; exit 1; fi
+# Arch minimal install with LUKS (root/home), Btrfs subvols, systemd-boot, Hyprland (no DM)
+# i5 + RTX 3060; VeraCrypt free tail preserved; NO time sync; NO TPM; NO final checks in this script.
 
-# ---- CONFIG ----
-DISK="/dev/sda"
-HOSTNAME="arch-pc"
-USER_NAME="user404"
-TZONE="Europe/Amsterdam"
-LANGV="en_US.UTF-8"
-EFI_SIZE="+1G"
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+### --- Настройки (можно править) ---
+DISK_DEFAULT="/dev/sda"              # Диск по умолчанию
+HOSTNAME="myarch"
+USERNAME="user404"
+USER_SHELL="/usr/bin/zsh"
+
+# Локали/TTY
+LOCALE_MAIN="en_US.UTF-8"
+LOCALE_EXTRA="ru_RU.UTF-8"
+TTY_KEYMAP="us"
+TTY_FONT="cyr-sun16"
+TTY_FONT_MAP="8859-5"
+
+# Разметка
+ESP_SIZE="+1G"
 ROOT_SIZE="+120G"
 HOME_SIZE="+250G"
-LOG="/tmp/arch_min_plus_fixed.log"
-# -----------------
 
-exec > >(tee -a "$LOG") 2>&1
+# ZRAM
+ZRAM_SIZE="16G"
+ZRAM_ALGO="zstd"
 
-# helper: require tools
-require_tools() {
-  for cmd in sgdisk cryptsetup mkfs.fat mkfs.btrfs partprobe btrfs pacstrap genfstab arch-chroot blkid lspci pacman; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "[X] Required tool '$cmd' not found in live image."; exit 1; }
-  done
+# Hyprland пример (проверьте имена выходов позже `hyprctl monitors`)
+HYPR_MON1="DP-1, 1920x1080@60, 0x0, 1"
+HYPR_MON2="HDMI-A-1, 1920x1080@60, 1920x0, 1"
+
+### --- Глобальные переменные ---
+MNT="/mnt"
+LUKS_NAME_ROOT="root"
+LUKS_NAME_HOME="home"
+
+### --- Логирование/ошибки ---
+log() { printf "\n\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+warn(){ printf "\n\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+err() { printf "\n\033[1;31m[ERR]\033[0m  %s\n" "$*"; }
+on_err() {
+  err "Произошла ошибка на строке $1. Скрипт остановлен."
+  err "Смонтированные точки будут попытаны к размонтированию."
+  umount -R "$MNT" 2>/dev/null || true
+  exit 1
 }
-require_tools
+trap 'on_err $LINENO' ERR
 
-[[ -d /sys/firmware/efi/efivars ]] || { echo "[X] UEFI not detected"; exit 1; }
-echo "This will WIPE $DISK. Ctrl+C to abort. Continue in 5s..."; sleep 5
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Запустите скрипт от root."
+    exit 1
+  fi
+}
 
-# read password + confirmation function
-prompt_password_confirm() {
-  local prompt_var_name="$1"   # name of variable to set (pass by name)
-  local prompt_text="$2"
-  local p1 p2
-  while :; do
-    read -rsp "$prompt_text" p1; echo
-    read -rsp "Confirm: " p2; echo
-    if [[ "$p1" == "$p2" && -n "$p1" ]]; then
-      # assign to caller variable name
-      printf -v "$prompt_var_name" "%s" "$p1"
+require_uefi() {
+  if [[ ! -d /sys/firmware/efi/efivars ]]; then
+    err "UEFI не обнаружен. Включите UEFI и отключите Secure Boot."
+    exit 1
+  fi
+}
+
+prompt_disk() {
+  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+  echo
+  read -rp "Диск для установки (Enter для ${DISK_DEFAULT}, или укажите явно, напр. /dev/nvme0n1): " DISK
+  DISK="${DISK:-$DISK_DEFAULT}"
+
+  if [[ ! -b "$DISK" ]]; then
+    err "Устройство $DISK не существует."
+    exit 1
+  fi
+
+  warn "ВНИМАНИЕ: ВСЕ ДАННЫЕ НА ${DISK} БУДУТ УДАЛЕНЫ."
+  read -rp "Для подтверждения введите: YES_TO_ERASE ${DISK} : " CONF
+  if [[ "$CONF" != "YES_TO_ERASE ${DISK}" ]]; then
+    err "Подтверждение не получено. Выход."
+    exit 1
+  fi
+  echo "$DISK"
+}
+
+partition_disk() {
+  local disk="$1"
+  log "Разметка диска ${disk} (ESP ${ESP_SIZE} → ROOT ${ROOT_SIZE} → HOME ${HOME_SIZE} → остальное свободно)"
+  sgdisk --zap-all "$disk"
+
+  # 1: EFI System Partition
+  sgdisk -n 1:0:"${ESP_SIZE}"   -t 1:EF00 -c 1:"EFI System Partition" "$disk"
+  # 2: LUKS-ROOT
+  sgdisk -n 2:0:"${ROOT_SIZE}"  -t 2:8300 -c 2:"LUKS-ROOT"            "$disk"
+  # 3: LUKS-HOME
+  sgdisk -n 3:0:"${HOME_SIZE}"  -t 3:8300 -c 3:"LUKS-HOME"            "$disk"
+
+  partprobe "$disk"
+}
+
+read_pass() {
+  local label="$1"
+  local pass pass2
+  while true; do
+    read -rs -p "Введите пароль для ${label}: " pass; echo
+    read -rs -p "Повторите пароль для ${label}: " pass2; echo
+    if [[ "$pass" == "$pass2" && -n "$pass" ]]; then
+      printf '%s' "$pass"
       return 0
     fi
-    echo "[!] Passwords do not match or empty — try again."
+    warn "Пароли не совпадают или пусты. Повторите."
   done
 }
 
-# Ask root and user passwords with confirmation
-prompt_password_confirm ROOT_PW "Root password: "
-prompt_password_confirm USER_PW "Password for ${USER_NAME}: "
+setup_luks() {
+  local p2="$1" p3="$2"
+  log "Форматирование LUKS (root/home)"
+  local pass_root pass_home
+  pass_root="$(read_pass "${p2} (ROOT)")"
+  pass_home="$(read_pass "${p3} (HOME)")"
 
-# partition name handling
-case "$DISK" in *nvme*) P1="${DISK}p1"; P2="${DISK}p2"; P3="${DISK}p3" ;; *) P1="${DISK}1"; P2="${DISK}2"; P3="${DISK}3" ;; esac
+  # Создание контейнеров (без лишних вопросов)
+  printf '%s' "$pass_root" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 --batch-mode "$p2" --key-file -
+  printf '%s' "$pass_home" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 --batch-mode "$p3" --key-file -
 
-echo "==> cleanup (if rerun)"
-swapoff -a || true
-umount -R /mnt || true
-for m in root home; do [[ -e /dev/mapper/$m ]] && cryptsetup close "$m" || true; done
-wipefs -af "$DISK" || true
-sgdisk --zap-all "$DISK" || true
+  # Открытие
+  printf '%s' "$pass_root" | cryptsetup open "$p2" "$LUKS_NAME_ROOT" --key-file -
+  printf '%s' "$pass_home" | cryptsetup open "$p3" "$LUKS_NAME_HOME" --key-file -
 
-echo "==> partition: EFI / LUKS-root / LUKS-home"
-sgdisk -n1:0:${EFI_SIZE}  -t1:ef00 -c1:EFI        "$DISK"
-sgdisk -n2:0:${ROOT_SIZE} -t2:8309 -c2:LUKS-ROOT  "$DISK"
-sgdisk -n3:0:${HOME_SIZE} -t3:8309 -c3:LUKS-HOME  "$DISK"
-partprobe "$DISK" >/dev/null 2>&1 || true; udevadm settle || true
+  # Очистка переменных
+  pass_root=""; pass_home=""
+}
 
-echo "==> format + open LUKS"
-mkfs.fat -F32 -n EFI "$P1"
+setup_btrfs_and_mount() {
+  local esp="$1" mroot="/dev/mapper/${LUKS_NAME_ROOT}" mhome="/dev/mapper/${LUKS_NAME_HOME}"
 
-# IMPORTANT: keep cryptsetup interactive so user is prompted to enter LUKS passphrase.
-# do NOT use --batch-mode or pipe the passphrase here if you want to be asked at open time.
-echo "LUKS ROOT: you will be asked to enter and confirm passphrase interactively by cryptsetup."
-cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P2"
-cryptsetup open "$P2" root
+  log "Создание ФС: ESP (FAT32), ROOT (btrfs), HOME (btrfs)"
+  mkfs.fat -F32 "$esp"
+  mkfs.btrfs -f "$mroot"
+  mkfs.btrfs -f "$mhome"
 
-echo "LUKS HOME: you will be asked to enter and confirm passphrase interactively by cryptsetup."
-cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P3"
-cryptsetup open "$P3" home
+  log "Создание сабволюмов (root/home)"
+  mount "$mroot" "$MNT"
+  btrfs subvolume create "$MNT/@"
+  btrfs subvolume create "$MNT/@snapshots"
+  btrfs subvolume create "$MNT/@var_log"
+  btrfs subvolume create "$MNT/@var_tmp"
+  btrfs subvolume create "$MNT/@pkg"
+  umount "$MNT"
 
-# ... (the rest of your script remains mostly unchanged: mkfs btrfs, create subvols, mount, pacstrap, etc.)
-# For brevity include the key parts about pacstrap behavior below.
+  mount "$mhome" "$MNT"
+  btrfs subvolume create "$MNT/@home"
+  btrfs subvolume create "$MNT/@home.snapshots"
+  umount "$MNT"
 
-echo "==> mkfs btrfs + subvolumes"
-mkfs.btrfs -L ROOT /dev/mapper/root
-mkfs.btrfs -L HOME /dev/mapper/home
+  log "Монтирование сабволюмов"
+  mount -o noatime,compress=zstd,subvol=@ "$mroot" "$MNT"
+  mkdir -p "$MNT/.snapshots" "$MNT/var/log" "$MNT/var/tmp" "$MNT/var/cache/pacman/pkg" "$MNT/home"
+  mount -o noatime,compress=zstd,subvol=@snapshots     "$mroot" "$MNT/.snapshots"
+  mount -o noatime,compress=zstd,subvol=@var_log       "$mroot" "$MNT/var/log"
+  mount -o noatime,compress=zstd,subvol=@var_tmp       "$mroot" "$MNT/var/tmp"
+  mount -o noatime,compress=zstd,subvol=@pkg           "$mroot" "$MNT/var/cache/pacman/pkg"
 
-mount /dev/mapper/root /mnt
-btrfs subvolume create /mnt/@
-btrfs subvolume create /mnt/@snapshots
-btrfs subvolume create /mnt/@var_log
-btrfs subvolume create /mnt/@var_tmp
-btrfs subvolume create /mnt/@pkg
-umount /mnt
+  mount -o noatime,compress=zstd,subvol=@home          "$mhome" "$MNT/home"
+  mkdir -p "$MNT/home/.snapshots"
+  mount -o noatime,compress=zstd,subvol=@home.snapshots "$mhome" "$MNT/home/.snapshots"
 
-mount /dev/mapper/home /mnt
-btrfs subvolume create /mnt/@home
-btrfs subvolume create /mnt/@home.snapshots
-umount /mnt
+  mkdir -p "$MNT/boot"
+  mount "$esp" "$MNT/boot"
+}
 
-mount -o rw,noatime,ssd,compress=zstd,subvol=@ /dev/mapper/root /mnt
-mkdir -p /mnt/.snapshots /mnt/var/log /mnt/var/tmp /mnt/var/cache/pacman/pkg /mnt/home /mnt/boot
-mount -o rw,noatime,ssd,compress=zstd,subvol=@snapshots /dev/mapper/root /mnt/.snapshots
-mount -o rw,noatime,ssd,compress=zstd,subvol=@var_log /dev/mapper/root /mnt/var/log
-mount -o rw,noatime,ssd,compress=zstd,subvol=@var_tmp /dev/mapper/root /mnt/var/tmp
-mount -o rw,noatime,ssd,compress=zstd,subvol=@pkg /dev/mapper/root /mnt/var/cache/pacman/pkg
+bootstrap_base() {
+  log "Базовая система (pacstrap) — это может занять несколько минут..."
+  # Не задаём вопросы pacman/pacstrap:
+  export PACMAN="pacman --noconfirm"
+  pacstrap -K "$MNT" base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager
+  genfstab -U "$MNT" >> "$MNT/etc/fstab"
+}
 
-mount -o rw,noatime,ssd,compress=zstd,subvol=@home /dev/mapper/home /mnt/home
-mkdir -p /mnt/home/.snapshots
-mount -o rw,noatime,ssd,compress=zstd,subvol=@home.snapshots /dev/mapper/home /mnt/home/.snapshots
+chroot_phase() {
+  local disk="$1"
+  local p2="${disk}2"
+  local p3="${disk}3"
 
-mount "$P1" /mnt/boot
+  local uuid_root uuid_home
+  uuid_root="$(blkid -s UUID -o value "$p2")"
+  uuid_home="$(blkid -s UUID -o value "$p3")"
 
-# Prepare package list (minimal per your spec)
-PKGS=(base linux linux-firmware btrfs-progs intel-ucode networkmanager nvidia nvidia-utils hyprland xorg-xwayland qt6-wayland egl-wayland xdg-desktop-portal xdg-desktop-portal-hyprland firefox wezterm noto-fonts noto-fonts-emoji ttf-dejavu ttf-nerd-fonts-symbols-mono snapper zram-generator zsh zsh-completions sudo kbd)
+  log "Выполнение конфигурации внутри chroot (это займёт время: mkinitcpio, pacman...)"
 
-# pacstrap: prefer --noconfirm --needed; if pacstrap on this ISO doesn't support it, prepopulate keyring
-if pacstrap --help 2>/dev/null | grep -q -- '--noconfirm'; then
-  pacstrap -K --noconfirm --needed /mnt "${PKGS[@]}"
-else
-  # ensure keyring present / update to avoid interactive 'trust key?' prompts
-  echo "pacstrap lacks --noconfirm: populating keyring in live-system to avoid interactive prompts..."
-  pacman -Sy --noconfirm archlinux-keyring || true
-  yes | pacstrap /mnt "${PKGS[@]}"
+  arch-chroot "$MNT" /usr/bin/env bash --noprofile --norc -euo pipefail -c "
+set -Eeuo pipefail
+IFS=\$'\n\t'
+export PACMAN_OPTS='--noconfirm --needed'
+
+# Локали/hostname
+sed -i \"s/^#\\s*${LOCALE_MAIN}.*/${LOCALE_MAIN} UTF-8/\" /etc/locale.gen
+sed -i \"s/^#\\s*${LOCALE_EXTRA}.*/${LOCALE_EXTRA} UTF-8/\" /etc/locale.gen
+locale-gen
+printf '%s\n' 'LANG=${LOCALE_MAIN}' > /etc/locale.conf
+printf '%s\n' '${HOSTNAME}' > /etc/hostname
+
+# vconsole (TTY)
+cat >/etc/vconsole.conf <<EOF_VC
+KEYMAP=${TTY_KEYMAP}
+FONT=${TTY_FONT}
+FONT_MAP=${TTY_FONT_MAP}
+EOF_VC
+
+# Пользователь/шелл
+pacman \${PACMAN_OPTS} -S zsh zsh-completions
+echo 'Задайте пароль для root:'
+passwd
+useradd -m -G wheel -s ${USER_SHELL} ${USERNAME}
+echo 'Задайте пароль для пользователя ${USERNAME}:'
+passwd ${USERNAME}
+echo '%wheel ALL=(ALL) ALL' >> /etc/sudoers
+
+# NVIDIA + KMS
+pacman \${PACMAN_OPTS} -S nvidia nvidia-utils nvidia-settings
+echo 'options nvidia-drm modeset=1' > /etc/modprobe.d/nvidia.conf
+
+# mkinitcpio (без TPM)
+sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_drm nvidia_modeset btrfs)/' /etc/mkinitcpio.conf
+sed -i 's|^BINARIES=.*|BINARIES=(/usr/bin/btrfs)|' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
+echo 'Сборка initramfs... (mkinitcpio -P)'
+mkinitcpio -P
+
+# systemd-boot
+bootctl install
+cat >/boot/loader/loader.conf <<'EOF_LDR'
+default arch.conf
+timeout 1
+console-mode max
+editor no
+auto-entries yes
+EOF_LDR
+
+cat >/boot/loader/entries/arch.conf <<EOF_ENT
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /intel-ucode.img
+initrd  /initramfs-linux.img
+options rd.luks.name=${uuid_root}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
+EOF_ENT
+
+# crypttab (TRIM только на уровне LUKS)
+cat >/etc/crypttab <<EOF_CRY
+home    UUID=${uuid_home}    none    luks,discard
+EOF_CRY
+
+# Сеть и TRIM
+systemctl enable NetworkManager
+systemctl enable fstrim.timer
+
+# Hyprland + порталы + браузер + терминал
+pacman \${PACMAN_OPTS} -S hyprland xorg-xwayland qt6-wayland egl-wayland xdg-desktop-portal xdg-desktop-portal-hyprland firefox wezterm
+
+# Конфиг Hyprland
+install -d -m 0700 -o ${USERNAME} -g ${USERNAME} /home/${USERNAME}/.config/hypr
+cat >/home/${USERNAME}/.config/hypr/hyprland.conf <<'EOF_HYPR'
+# Проверьте имена мониторов `hyprctl monitors` после первого входа
+monitor = ${HYPR_MON1}
+monitor = ${HYPR_MON2}
+
+workspace = 1, monitor:DP-1
+workspace = 2, monitor:HDMI-A-1
+
+\$mainMod = SUPER
+\$terminal = wezterm
+
+input {
+  kb_layout = us,ru
+  kb_options = grp:caps_toggle,terminate:ctrl_alt_bksp
+}
+
+bind = \$mainMod, Q, exec, \$terminal
+bind = \$mainMod, Return, exec, \$terminal
+
+exec-once = firefox
+exec-once = wezterm
+EOF_HYPR
+chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/hypr
+
+# Автозапуск Hyprland на tty1 (без DM)
+cat >/home/${USERNAME}/.zprofile <<'EOF_ZP'
+if [ \"\$(tty)\" = \"/dev/tty1\" ]; then
+  exec dbus-run-session Hyprland
 fi
+EOF_ZP
+chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.zprofile
+chmod 0644 /home/${USERNAME}/.zprofile
 
-# make fstab
-genfstab -U /mnt > /mnt/etc/fstab
+# WezTerm + шрифты
+pacman \${PACMAN_OPTS} -S ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
+install -d -m 0700 -o ${USERNAME} -g ${USERNAME} /home/${USERNAME}/.config/wezterm
+cat >/home/${USERNAME}/.config/wezterm/wezterm.lua <<'EOF_WZ'
+local wezterm = require 'wezterm'
+return {
+  enable_wayland = true,
+  font = wezterm.font_with_fallback({
+    'DejaVu Sans Mono',
+    'Symbols Nerd Font Mono',
+    'Noto Color Emoji',
+  }),
+}
+EOF_WZ
+chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/wezterm
 
-# set up UUIDs etc. (snippet)
-ROOT_UUID="$(blkid -s UUID -o value "$P2")"
-HOME_UUID="$(blkid -s UUID -o value "$P3")"
+# ZRAM
+pacman \${PACMAN_OPTS} -S zram-generator
+cat >/etc/systemd/zram-generator.conf <<'EOF_ZR'
+[zram0]
+zram-size = ${ZRAM_SIZE}
+compression-algorithm = ${ZRAM_ALGO}
+EOF_ZR
+systemctl daemon-reload
+systemctl enable dev-zram0.swap
+# стартовать swap на первом буте; сейчас активировать можно, но не обязательно:
+systemctl start dev-zram0.swap || true
 
-# configure in chroot (you can reuse your existing chroot block)
-# ... (omitted here for brevity; keep your config steps: locale, mkinitcpio, bootctl, crypttab, services, user creation)
+# Snapper (два конфига, без таймлайна, базовый снапшот)
+pacman \${PACMAN_OPTS} -S snapper
+snapper -c root create-config /
+snapper -c home create-config /home
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE=\"no\"/' /etc/snapper/configs/root
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP=\"no\"/'   /etc/snapper/configs/root
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE=\"no\"/' /etc/snapper/configs/home
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP=\"no\"/'   /etc/snapper/configs/home
+snapper -c root create --description 'baseline-0'
 
-# set passwords safely (pass via stdin to chpasswd) and then unset
-printf '%s\n' "root:${ROOT_PW}" | arch-chroot /mnt chpasswd
-printf '%s\n' "${USER_NAME}:${USER_PW}" | arch-chroot /mnt chpasswd
-unset ROOT_PW USER_PW
+# Гигиена прав
+install -d -m 0700 -o ${USERNAME} -g ${USERNAME} /home/${USERNAME}/.config
+chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config
+chmod 0644 /etc/mkinitcpio.conf /boot/loader/loader.conf
+chmod 0644 /boot/loader/entries/arch.conf
+chmod 0600 /etc/crypttab
 
-echo "Installation finished. Logs: $LOG"
-echo "Run: umount -R /mnt ; reboot"
+# Важно: locale/tty уже настроены, тайм-синхронизацию специально не выполняем.
+"
+
+  # конец arch-chroot
+}
+
+finish_and_hint() {
+  log "Готово. Размонтирование и подсказки."
+  umount -R "$MNT"
+  swapoff /dev/zram0 2>/dev/null || true
+
+  cat <<'NOTE'
+
+✅ Установка завершена.
+
+Далее:
+1) Перезагрузитесь:  reboot
+2) На экране пароля LUKS введите пароль для ROOT-контейнера.
+3) Войдите под пользователем, Hyprland стартует автоматически на tty1.
+4) При необходимости скорректируйте имена мониторов в:
+   ~/.config/hypr/hyprland.conf
+
+Примечания:
+- TRIM выполняется еженедельно (fstrim.timer), discard используется только на уровне LUKS.
+- Snapper настроен на ручные снапшоты; создан baseline-0.
+- Пакеты ставились без подтверждений (—noconfirm), чтобы исключить подвисания.
+
+NOTE
+}
+
+main() {
+  require_root
+  require_uefi
+  local DISK; DISK="$(prompt_disk)"
+  local P1="${DISK}1" P2="${DISK}2" P3="${DISK}3"
+
+  partition_disk "$DISK"
+  setup_luks "$P2" "$P3"
+  setup_btrfs_and_mount "$P1"
+  bootstrap_base
+  chroot_phase "$DISK"
+  finish_and_hint
+}
+
+main "$@"

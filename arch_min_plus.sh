@@ -1,398 +1,364 @@
 #!/usr/bin/env bash
-# Minimal Arch installer (LUKS root/home, Btrfs subvols, systemd-boot, Hyprland)
-# Adjusted to user's preferences:
-# - assumes non-NVMe disk names (e.g. /dev/sda)
-# - ASCII-only prompts (no Cyrillic)
-# - simple confirmation "YES" before destructive actions
-# - avoids sed edits of system files (writes full small files instead)
-# - hostname = arch-pc
-# - LUKS: password entered twice (confirmation); keyfile used temporarily and securely removed
-# - pacstrap/pacman remain interactive so you can answer 'Y' when prompted
-set -Eeuo pipefail
+# Minimal Arch installer script (UEFI, LUKS on /dev/sda, Btrfs subvolumes, systemd-boot, Hyprland)
+# Based on provided spec. All prompts are in ASCII (Latin). Confirm destructive actions with YES.
+# Run from Arch live ISO as root.
+#
+# Usage: boot live ISO -> connect internet -> mount repo if needed -> su - (root) -> ./arch_install_min.sh
+set -euo pipefail
 IFS=$'\n\t'
 
-# ------------------ Configuration (edit as needed) ------------------
-DISK_DEFAULT="/dev/sda"
-HOSTNAME="arch-pc"
+# -------- Configuration (edit only if you know what you do) ----------
+DEFAULT_DISK="/dev/sda"
+ESP_SIZE_G="1G"
+ROOT_SIZE_G="120G"
+HOME_SIZE_G="250G"
+HOSTNAME="myarch"
 USERNAME="user404"
 USER_SHELL="/usr/bin/zsh"
+TIMEZONE="Europe/Amsterdam"
+LOCALE_MAIN="en_US.UTF-8 UTF-8"
+LOCALE_RU="ru_RU.UTF-8 UTF-8"
+BTRFS_MOUNT_OPTS="noatime,compress=zstd"
+# Packages installed via pacstrap (minimal) and extra in chroot
+PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager)
+CHROOT_PKGS=(zsh zsh-completions sudo cryptsetup mkinitcpio linux-headers snapper zram-generator \
+             nvidia nvidia-utils nvidia-settings hyprland xorg-xwayland qt6-wayland egl-wayland \
+             xdg-desktop-portal xdg-desktop-portal-hyprland firefox wezterm \
+             ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu)
+# --------------------------------------------------------------------
 
-LOCALE_MAIN="en_US.UTF-8"
-LOCALE_EXTRA="ru_RU.UTF-8"   # this is ASCII text "ru_RU.UTF-8 UTF-8" we'll write into locale.gen
-
-TTY_KEYMAP="us"
-TTY_FONT="ter-v16n"          # use an ASCII name font that usually exists in kbd
-TTY_FONT_MAP="8859-5"
-
-ESP_SIZE="+1G"
-ROOT_SIZE="+120G"
-HOME_SIZE="+250G"
-
-ZRAM_SIZE="16G"
-ZRAM_ALGO="zstd"
-
-HYPR_MON1="DP-1, 1920x1080@60, 0x0, 1"
-HYPR_MON2="HDMI-A-1, 1920x1080@60, 1920x0, 1"
-
-MNT="/mnt"
-LUKS_NAME_ROOT="root"
-LUKS_NAME_HOME="home"
-TMP_KEYFILE="/tmp/arch_luks_key.bin"
-# -------------------------------------------------------------------
-
-log()  { printf "\n[INFO] %s\n" "$*"; }
-warn() { printf "\n[WARN] %s\n" "$*"; }
-err()  { printf "\n[ERR] %s\n" "$*"; }
-
-on_err() {
-  err "Error on line $1. Attempting to unmount ${MNT} and exit."
-  umount -R "$MNT" 2>/dev/null || true
-  # try to close any opened dm-crypt names
-  for m in "${LUKS_NAME_ROOT}" "${LUKS_NAME_HOME}"; do
-    if cryptsetup status "$m" &>/dev/null; then
-      cryptsetup close "$m" || true
-    fi
-  done
-  rm -f "$TMP_KEYFILE" 2>/dev/null || true
-  exit 1
-}
-trap 'on_err $LINENO' ERR
+log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+err() { log "ERROR: $*" >&2; exit 1; }
 
 require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    err "Please run as root."
-    exit 1
+  if [ "$EUID" -ne 0 ]; then
+    err "This script must be run as root."
   fi
 }
 
-require_tools() {
-  local t
-  for t in sgdisk cryptsetup mkfs.fat mkfs.btrfs partprobe btrfs pacstrap genfstab arch-chroot blkid lspci pacman shred; do
-    if ! command -v "$t" >/dev/null 2>&1; then
-      warn "Tool '$t' not found in live image. It may be required later."
-    fi
+pause_for_user_confirm() {
+  local prompt="$1"
+  local answer
+  printf "\n%s\n" "$prompt"
+  printf "Type YES to continue, anything else to abort: "
+  read -r answer
+  if [ "$answer" != "YES" ]; then
+    err "User aborted."
+  fi
+}
+
+check_command() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+}
+
+install_if_missing() {
+  local pkg="$1"
+  if ! pacman -Qq "$pkg" >/dev/null 2>&1; then
+    log "Installing helper package: $pkg (non-interactive)"
+    pacman -S --noconfirm --needed "$pkg"
+  fi
+}
+
+# Wait helper - long running commands
+wait_for() {
+  local pid=$1
+  # simple spinner while process runs
+  local -r delay=0.5
+  local spinstr='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do
+    for i in $(seq 1 4); do
+      printf "\r[%c] waiting..." "${spinstr:i-1:1}"
+      sleep $delay
+    done
   done
+  printf "\r"
 }
 
-prompt_disk() {
-  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
-  echo
-  read -rp "Target install disk (Enter for ${DISK_DEFAULT}): " DISK
-  DISK="${DISK:-$DISK_DEFAULT}"
+# -------- Main flow ----------
+require_root
 
-  if [[ ! -b "$DISK" ]]; then
-    err "Device $DISK does not exist."
-    exit 1
-  fi
+log "Displaying block devices. Check which disk to use."
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
 
-  warn "ALL DATA ON ${DISK} WILL BE ERASED."
-  read -rp "Type YES to continue: " CONF
-  if [[ "$CONF" != "YES" ]]; then
-    err "Confirmation not received, aborting."
-    exit 1
-  fi
+printf "\nDefault disk is %s\n" "$DEFAULT_DISK"
+printf "If you want to use a different disk, enter full path (e.g. /dev/nvme0n1). Otherwise press ENTER to accept default: "
+read -r DISK_INPUT
+DISK="${DISK_INPUT:-$DEFAULT_DISK}"
 
-  printf '%s' "$DISK"
-}
+if [ ! -b "$DISK" ]; then
+  err "Disk $DISK not found as block device."
+fi
 
-partition_disk() {
-  local disk="$1"
-  log "Partitioning ${disk}: ESP ${ESP_SIZE} → ROOT ${ROOT_SIZE} → HOME ${HOME_SIZE} (rest left unpartitioned)"
-  sgdisk --zap-all "$disk"
+pause_for_user_confirm "WARNING: The script will DESTROY ALL DATA on $DISK. Proceed only when you are SURE."
 
-  # Use GUID type 8309 for LUKS (helps tools and readability)
-  sgdisk -n 1:0:${ESP_SIZE} -t 1:ef00  -c 1:"EFI System Partition" "$disk"
-  sgdisk -n 2:0:${ROOT_SIZE} -t 2:8309  -c 2:"LUKS-ROOT" "$disk"
-  sgdisk -n 3:0:${HOME_SIZE} -t 3:8309  -c 3:"LUKS-HOME" "$disk"
+log "Ensuring gptfdisk (sgdisk) is available..."
+if ! check_command sgdisk; then
+  log "sgdisk not found. Will install gptfdisk (pacman). This will be non-interactive."
+  pacman -Sy --noconfirm gptfdisk
+fi
 
-  partprobe "$disk" >/dev/null 2>&1 || true
-  udevadm settle >/dev/null 2>&1 || true
-}
+log "Creating new GPT on $DISK and partitions (ESP 1G, ROOT ${ROOT_SIZE_G}, HOME ${HOME_SIZE_G}, rest left unpartitioned)."
+# Create GPT and partitions using sgdisk
+sgdisk --zap-all "$DISK"
+sgdisk --clear "$DISK"
+# Partition 1: ESP, type EF00
+sgdisk -n 1:0:+${ESP_SIZE_G} -t 1:ef00 "$DISK"
+# Partition 2: ROOT
+sgdisk -n 2:0:+${ROOT_SIZE_G} -t 2:8300 "$DISK"
+# Partition 3: HOME
+sgdisk -n 3:0:+${HOME_SIZE_G} -t 3:8300 "$DISK"
+# Write changes
+sgdisk -p "$DISK"
+log "Partitioning done. Running partprobe..."
+partprobe "$DISK" || true
+sleep 1
 
-read_pass_confirm() {
-  local label="$1"
-  local a b
-  while :; do
-    read -rs -p "Enter passphrase for ${label}: " a; echo
-    read -rs -p "Confirm passphrase for ${label}: " b; echo
-    if [[ -n "$a" && "$a" == "$b" ]]; then
-      printf '%s' "$a"
-      return 0
-    fi
-    warn "Passphrases did not match or empty. Try again."
-  done
-}
+ESP="${DISK}1"
+P2="${DISK}2"
+P3="${DISK}3"
 
-setup_luks() {
-  local p2="$1" p3="$2"
-  log "Preparing LUKS containers on ${p2} and ${p3}."
+log "Partitions: ESP=$ESP, ROOT=$P2, HOME=$P3"
 
-  # Ask passphrases (2x confirmation each). We'll write a temporary keyfile (secure mode)
-  local pass_root pass_home
-  pass_root="$(read_pass_confirm "${p2} (ROOT)")"
-  pass_home="$(read_pass_confirm "${p3} (HOME)")"
+pause_for_user_confirm "About to setup LUKS on ${P2} and ${P3} and format filesystems. This will overwrite these partitions."
 
-  # create temporary keyfile (secure permissions)
-  umask 077
-  printf '%s\n' "$pass_root" > "$TMP_KEYFILE"
-  chmod 600 "$TMP_KEYFILE"
+log "Setting up LUKS (LUKS2, argon2id) on $P2 and $P3. You will be prompted for passphrases twice (root and home)."
+cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P2"
+cryptsetup open "$P2" root
+cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P3"
+cryptsetup open "$P3" home
 
-  # Use keyfile to format and open (automated). If you prefer interactive open (3rd prompt),
-  # remove --key-file and the printf earlier; here we choose automation + secure deletion.
-  log "Formatting LUKS containers (using temporary keyfile). You will not be prompted now for LUKS passphrases."
-  cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$p2" --key-file "$TMP_KEYFILE"
-  cryptsetup open "$p2" "$LUKS_NAME_ROOT" --key-file "$TMP_KEYFILE"
+log "Formatting filesystems..."
+mkfs.fat -F32 "$ESP"
+mkfs.btrfs -f /dev/mapper/root
+mkfs.btrfs -f /dev/mapper/home
 
-  cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$p3" --key-file "$TMP_KEYFILE"
-  cryptsetup open "$p3" "$LUKS_NAME_HOME" --key-file "$TMP_KEYFILE"
+log "Creating Btrfs subvolumes for root..."
+mount /dev/mapper/root /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@var_log
+btrfs subvolume create /mnt/@var_tmp
+btrfs subvolume create /mnt/@pkg
+umount /mnt
 
-  # wipe passphrases from variables and securely remove keyfile
-  pass_root=""; pass_home=""
-  if command -v shred >/dev/null 2>&1; then
-    shred -u "$TMP_KEYFILE" || rm -f "$TMP_KEYFILE"
-  else
-    rm -f "$TMP_KEYFILE"
-  fi
-  umask 022
-}
+log "Creating Btrfs subvolumes for home..."
+mount /dev/mapper/home /mnt
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@home.snapshots
+umount /mnt
 
-setup_btrfs_and_mount() {
-  local esp="$1" mroot="/dev/mapper/${LUKS_NAME_ROOT}" mhome="/dev/mapper/${LUKS_NAME_HOME}"
+log "Mounting subvolumes..."
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@ /dev/mapper/root /mnt
+mkdir -p /mnt/.snapshots /mnt/var/log /mnt/var/tmp /mnt/var/cache/pacman/pkg /mnt/home
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@snapshots /dev/mapper/root /mnt/.snapshots
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@var_log   /dev/mapper/root /mnt/var/log
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@var_tmp   /dev/mapper/root /mnt/var/tmp
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@pkg       /dev/mapper/root /mnt/var/cache/pacman/pkg
 
-  log "Formatting filesystems: ESP (FAT32), ROOT and HOME (btrfs)"
-  mkfs.fat -F32 -n EFI "$esp"
-  mkfs.btrfs -f -L ROOT "$mroot"
-  mkfs.btrfs -f -L HOME "$mhome"
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@home /dev/mapper/home /mnt/home
+mkdir -p /mnt/home/.snapshots
+mount -o ${BTRFS_MOUNT_OPTS},subvol=@home.snapshots /dev/mapper/home /mnt/home/.snapshots
 
-  log "Creating subvolumes"
-  mount "$mroot" "$MNT"
-  btrfs subvolume create "$MNT/@" || true
-  btrfs subvolume create "$MNT/@snapshots" || true
-  btrfs subvolume create "$MNT/@var_log" || true
-  btrfs subvolume create "$MNT/@var_tmp" || true
-  btrfs subvolume create "$MNT/@pkg" || true
-  umount "$MNT"
+mkdir -p /mnt/boot
+mount "$ESP" /mnt/boot
 
-  mount "$mhome" "$MNT"
-  btrfs subvolume create "$MNT/@home" || true
-  btrfs subvolume create "$MNT/@home.snapshots" || true
-  umount "$MNT"
+log "Ready to install base system with pacstrap."
+printf "Packages to be installed via pacstrap: %s\n" "${PACSTRAP_PKGS[*]}"
+pause_for_user_confirm "Proceed to run pacstrap (will run non-interactively after you confirm)?"
 
-  log "Mounting subvolumes with compress=zstd, noatime"
-  mount -o noatime,compress=zstd,subvol=@ "$mroot" "$MNT"
-  mkdir -p "$MNT/.snapshots" "$MNT/var/log" "$MNT/var/tmp" "$MNT/var/cache/pacman/pkg" "$MNT/home"
-  mount -o noatime,compress=zstd,subvol=@snapshots "$mroot" "$MNT/.snapshots"
-  mount -o noatime,compress=zstd,subvol=@var_log "$mroot" "$MNT/var/log"
-  mount -o noatime,compress=zstd,subvol=@var_tmp "$mroot" "$MNT/var/tmp"
-  mount -o noatime,compress=zstd,subvol=@pkg "$mroot" "$MNT/var/cache/pacman/pkg"
+# Run pacstrap non-interactively to avoid interactive pacman prompt issues. User already confirmed.
+log "Running pacstrap..."
+pacstrap /mnt "${PACSTRAP_PKGS[@]}" --noconfirm --needed
 
-  mount -o noatime,compress=zstd,subvol=@home "$mhome" "$MNT/home"
-  mkdir -p "$MNT/home/.snapshots"
-  mount -o noatime,compress=zstd,subvol=@home.snapshots "$mhome" "$MNT/home/.snapshots"
+log "Generating fstab..."
+genfstab -U /mnt >> /mnt/etc/fstab
 
-  mkdir -p "$MNT/boot"
-  mount "$esp" "$MNT/boot"
-}
+# Create chroot helper script
+cat > /mnt/root/chroot_setup.sh <<'CHROOT_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 
-bootstrap_base() {
-  log "Installing base system via pacstrap. You will be prompted to confirm package installation (answer 'Y' when asked)."
-  # Include kbd so console font exists during mkinitcpio to avoid "no font found" warning.
-  # Keep pacstrap interactive: do NOT use --noconfirm so you can type 'Y' when prompted.
-  pacstrap -K "$MNT" \
-    base linux linux-firmware btrfs-progs intel-ucode kbd \
-    networkmanager git nano \
-    nvidia nvidia-utils \
-    hyprland xorg-xwayland qt6-wayland egl-wayland xdg-desktop-portal xdg-desktop-portal-hyprland \
-    firefox wezterm \
-    noto-fonts noto-fonts-emoji ttf-dejavu ttf-nerd-fonts-symbols-mono \
-    snapper zram-generator zsh zsh-completions sudo
+# -------------- Inside chroot --------------
+log "Configuring locale, timezone, hostname..."
 
-  # write fstab (overwrite to avoid duplicates)
-  genfstab -U "$MNT" > "$MNT/etc/fstab"
-}
+# Timezone
+ln -sf /usr/share/zoneinfo/Europe/Amsterdam /etc/localtime
+hwclock --systohc
 
-write_target_files_before_chroot() {
-  # Generate locale.gen in target (no sed). This replaces editing locale.gen by hand.
-  cat > "$MNT/etc/locale.gen" <<EOF_LOCALE
-${LOCALE_MAIN} UTF-8
-${LOCALE_EXTRA} UTF-8
-EOF_LOCALE
+# Uncomment locales (safe sed: remove leading '#' and any spaces) for en_US and ru_RU
+sed -i 's/^[[:space:]]*#\?[[:space:]]*en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen || true
+sed -i 's/^[[:space:]]*#\?[[:space:]]*ru_RU\.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen || true
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-  echo "LANG=${LOCALE_MAIN}" > "$MNT/etc/locale.conf"
+# Vconsole for TTY
+cat >/etc/vconsole.conf <<'EOF'
+KEYMAP=us
+FONT=cyr-sun16
+FONT_MAP=8859-5
+EOF
 
-  # vconsole.conf
-  cat > "$MNT/etc/vconsole.conf" <<EOF_VC
-KEYMAP=${TTY_KEYMAP}
-FONT=${TTY_FONT}
-FONT_MAP=${TTY_FONT_MAP}
-EOF_VC
+echo "myarch" > /etc/hostname
 
-  # hostname & hosts
-  echo "${HOSTNAME}" > "$MNT/etc/hostname"
-  cat > "$MNT/etc/hosts" <<EOF_HOSTS
-127.0.0.1 localhost
-::1       localhost
-127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
-EOF_HOSTS
+log "Installing additional packages in chroot..."
+# We run pacman non-interactively to avoid broken interactive prompts in scripted run.
+pacman -Syu --noconfirm --needed zsh zsh-completions sudo cryptsetup mkinitcpio snapper zram-generator \
+    nvidia nvidia-utils nvidia-settings hyprland xorg-xwayland qt6-wayland egl-wayland \
+    xdg-desktop-portal xdg-desktop-portal-hyprland firefox wezterm \
+    ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
 
-  # crypttab for home: we will fill UUID later (after blkid)
-}
+log "Creating user and setting up sudo..."
+# Create user (if not exists) and set shell
+if ! id -u user404 >/dev/null 2>&1; then
+  useradd -m -G wheel -s /usr/bin/zsh user404 || true
+fi
 
-chroot_phase_and_final_config() {
-  # Determine partition device names (user indicated sda only, so P1/P2/P3 are disk1..)
-  local disk="$1"
-  local P1="${disk}1" P2="${disk}2" P3="${disk}3"
+echo "Set password for root now."
+passwd
+echo "Set password for user user404 now."
+passwd user404
+# Ensure wheel group has sudo
+echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 
-  # After luksFormat, blkid should show LUKS UUIDs; use partition devices (p2/p3)
-  local uuid_root uuid_home
-  uuid_root="$(blkid -s UUID -o value "$P2")" || true
-  uuid_home="$(blkid -s UUID -o value "$P3")" || true
+log "NVIDIA early KMS: modprobe options"
+mkdir -p /etc/modprobe.d
+cat >/etc/modprobe.d/nvidia.conf <<'EOF'
+options nvidia-drm modeset=1
+EOF
 
-  if [[ -z "$uuid_root" || -z "$uuid_home" ]]; then
-    warn "Could not read LUKS UUIDs from partitions; boot entry will still be created using /dev/mapper names."
-  fi
+log "Configuring mkinitcpio for systemd + btrfs + kms"
+# Replace MODULES, BINARIES, and HOOKS lines
+sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_drm nvidia_modeset btrfs)/' /etc/mkinitcpio.conf
+sed -i 's%^BINARIES=.*%BINARIES=(/usr/bin/btrfs)%' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 
-  # Write boot loader entry and crypttab on the target FS (host-side), expanding known UUIDs.
-  cat > "$MNT/boot/loader/loader.conf" <<'EOF_LDR'
+mkinitcpio -P
+
+log "Installing systemd-boot and creating loader entries..."
+bootctl install
+
+UUID_ROOT=$(blkid -s UUID -o value /dev/sda2 || true)
+if [ -z "$UUID_ROOT" ]; then
+  # fallback: attempt to read by PARTLABEL or use /dev/sda2
+  UUID_ROOT=$(blkid -s UUID -o value /dev/mapper/root || true)
+fi
+
+cat >/boot/loader/loader.conf <<'EOF'
 default arch.conf
 timeout 1
 console-mode max
 editor no
 auto-entries yes
-EOF_LDR
+EOF
 
-  if [[ -n "$uuid_root" ]]; then
-    ROOT_OPTION="rd.luks.name=${uuid_root}=${LUKS_NAME_ROOT} rd.luks.options=discard"
-  else
-    ROOT_OPTION=""
-  fi
-
-  cat > "$MNT/boot/loader/entries/arch.conf" <<EOF_ENTRY
+cat >/boot/loader/entries/arch.conf <<EOF
 title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options ${ROOT_OPTION} root=/dev/mapper/${LUKS_NAME_ROOT} rootflags=subvol=@,compress=zstd rw nvidia_drm.modeset=1
-EOF_ENTRY
+options rd.luks.name=${UUID_ROOT}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
+EOF
 
-  if [[ -n "$uuid_home" ]]; then
-    cat > "$MNT/etc/crypttab" <<EOF_CRY
-home    UUID=${uuid_home}    none    luks,discard
-EOF_CRY
-  else
-    warn "home UUID unknown: /etc/crypttab will be left for manual adjustment."
-  fi
+log "Writing /etc/crypttab for home with discard"
+UUID_HOME=$(blkid -s UUID -o value /dev/sda3 || true)
+cat >/etc/crypttab <<EOF
+home    UUID=${UUID_HOME}    none    luks,discard
+EOF
 
-  # Now perform chroot-level actions (interactive where appropriate)
-  log "Entering chroot to finalize configuration (you will be asked to set passwords and confirm some pacman operations)."
-  arch-chroot "$MNT" /bin/bash -eux <<'CHROOT_EOF'
-set -euo pipefail
-IFS=$'\n\t'
-
-# generate locales
-locale-gen
-
-# mkinitcpio: update hooks/modules/binaries (systemd scheme + btrfs + nvidia)
-# We'll rewrite a minimal mkinitcpio.conf to avoid fragile sed
-cat >/etc/mkinitcpio.conf <<'MK'
-MODULES=(nvidia nvidia_drm nvidia_modeset btrfs)
-BINARIES=(/usr/bin/btrfs)
-FILES=()
-HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)
-COMPRESSION="zstd"
-MK
-
-echo "Building initramfs images..."
-mkinitcpio -P
-
-# Install systemd-boot if not yet present
-bootctl install || true
-
-# enable services
+log "Enabling services: NetworkManager, fstrim.timer"
 systemctl enable NetworkManager
 systemctl enable fstrim.timer
 
-# Create user and set passwords interactively
-echo "Set root password now (interactive)."
-passwd
-
-useradd -m -G wheel -s ${USER_SHELL} ${USERNAME}
-echo "Set password for ${USERNAME} now (interactive)."
-passwd ${USERNAME}
-echo '%wheel ALL=(ALL) ALL' >> /etc/sudoers
-
-# NVIDIA module option
-echo 'options nvidia-drm modeset=1' > /etc/modprobe.d/nvidia.conf
-
-# zram (zram-generator should be present)
-cat >/etc/systemd/zram-generator.conf <<'ZR'
+log "Configuring zram (zram-generator)"
+cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-zram-size = ${ZRAM_SIZE}
-compression-algorithm = ${ZRAM_ALGO}
-ZR
+zram-size = 16G
+compression-algorithm = zstd
+EOF
+
 systemctl daemon-reload || true
-systemctl enable dev-zram0.swap || true
+# enable expected swap unit (name may vary); enable target device swap unit if present
+if systemctl list-units --full --all | grep -q 'dev-zram0.swap'; then
+  systemctl enable dev-zram0.swap || true
+fi
 
-# Snapper: create configs and disable timeline/cleanup via CLI
-pacman -S --needed snapper || true
-snapper -c root create-config / || true
+log "Setting up snapper for root and home (manual snapshots only)"
+pacman -S --noconfirm --needed snapper
+snapper -c root create-config /
 snapper -c home create-config /home || true
-snapper -c root set-config TIMELINE_CREATE=no NUMBER_CLEANUP=no || true
-snapper -c home set-config TIMELINE_CREATE=no NUMBER_CLEANUP=no || true
-snapper -c root create -d "baseline-0 post-install" || true
+# Disable timeline and auto NUMBER cleanup
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/root || true
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/' /etc/snapper/configs/root || true
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/home || true
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/' /etc/snapper/configs/home || true
+snapper -c root create --description "baseline-0" || true
 
-CHROOT_EOF
+log "Hyprland and user configs"
+install -d -m 0700 -o user404 -g user404 /home/user404/.config/hypr
+cat >/home/user404/.config/hypr/hyprland.conf <<'EOF'
+monitor = DP-1, 1920x1080@60, 0x0, 1
+monitor = HDMI-A-1, 1920x1080@60, 1920x0, 1
 
-  # chroot done
+workspace = 1, monitor:DP-1
+workspace = 2, monitor:HDMI-A-1
+
+$mainMod = SUPER
+$terminal = wezterm
+
+input {
+  kb_layout = us,ru
+  kb_options = grp:caps_toggle,terminate:ctrl_alt_bksp
 }
 
-finish_and_hint() {
-  log "Finishing: unmounting and hints"
-  # copy a small log to target system if exists
-  mkdir -p "$MNT/var/log/installer" || true
-  echo "Installation finished on $(date -u)" > "$MNT/var/log/installer/install-note.txt"
+bind = $mainMod, Q, exec, $terminal
+bind = $mainMod, Return, exec, $terminal
 
-  umount -R "$MNT" || true
+exec-once = firefox
+exec-once = wezterm
+EOF
+chown -R user404:user404 /home/user404/.config
 
-  cat <<'NOTE'
+cat >/home/user404/.zprofile <<'EOF'
+if [ "$(tty)" = "/dev/tty1" ]; then
+  exec dbus-run-session Hyprland
+fi
+EOF
+chown user404:user404 /home/user404/.zprofile
+chmod 0644 /home/user404/.zprofile
 
-Installation finished.
+log "Permissions hygiene"
+chmod 0644 /etc/mkinitcpio.conf /boot/loader/loader.conf || true
+chmod 0644 /boot/loader/entries/arch.conf || true
+chmod 0600 /etc/crypttab || true
+install -d -m 0700 -o user404 -g user404 /home/user404/.config
+chown -R user404:user404 /home/user404/.config
 
-Next steps:
-  1) Reboot the machine: reboot
-  2) At LUKS prompt, enter the passphrase you created earlier (if prompt appears).
-  3) Log in as your user; Hyprland should autostart on tty1 (you will set the user's password in chroot interactively).
-  4) If monitor names differ, edit ~/.config/hypr/hyprland.conf after first login.
+log "Chroot setup complete. Exit to continue on host."
+# End of chroot script
+CHROOT_SCRIPT
 
-Notes:
-- pacstrap and pacman were left interactive so you can confirm package installation with 'Y' when prompted.
-- The temporary LUKS keyfile was securely removed after opening the containers.
-- If you prefer cryptsetup to prompt interactively when opening the containers (third prompt), adjust setup_luks to omit --key-file usage.
+chmod +x /mnt/root/chroot_setup.sh
 
-NOTE
-}
+log "Entering chroot to finalize setup. You will be prompted for root and user passwords inside chroot."
+arch-chroot /mnt /root/chroot_setup.sh
 
-main() {
-  require_root
-  require_tools
+log "Cleaning up chroot helper..."
+rm -f /mnt/root/chroot_setup.sh
 
-  local DISK; DISK="$(prompt_disk)"
-  # user specified only sda typically; we assume non-nvme naming per your note
-  local P1="${DISK}1" P2="${DISK}2" P3="${DISK}3"
-
-  partition_disk "$DISK"
-
-  setup_luks "$P2" "$P3"
-
-  setup_btrfs_and_mount "$P1"
-
-  bootstrap_base
-
-  write_target_files_before_chroot
-
-  chroot_phase_and_final_config "$DISK"
-
-  finish_and_hint
-}
-
-main "$@"
+log "Final steps: unmounting and reboot suggestion."
+echo "Installation finished (most steps). Run final checks if needed."
+echo "To finalize: exit, umount -R /mnt and reboot."
+printf "\nReady to exit script. Type YES to unmount /mnt and reboot now, anything else to abort and stay in live environment: "
+read -r FINAL_ANS
+if [ "$FINAL_ANS" = "YES" ]; then
+  log "Attempting to unmount and reboot..."
+  umount -R /mnt || true
+  cryptsetup close root || true
+  cryptsetup close home || true
+  reboot
+else
+  log "Aborting reboot. You can manually unmount and reboot later."
+  exit 0
+fi

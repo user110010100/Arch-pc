@@ -81,7 +81,7 @@ FONT=cyr-sun16
 FONT_MAP=8859-5
 EOF
 
-echo "myarch" > /etc/hostname
+echo "arch-pc" > /etc/hostname
 
 log "Installing additional packages (non-interactive)..."
 pacman -Syu --noconfirm --needed \
@@ -149,6 +149,7 @@ cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
 zram-size = 16G
 compression-algorithm = zstd
+swap-priority = 100
 EOF
 
 # --- Snapper: try normal create-config, fallback to template if it fails ---
@@ -218,7 +219,7 @@ chmod 0644 /home/user404/.config/hypr/hyprland.conf || true
 cat >/home/user404/.config/wezterm/wezterm.lua <<'EOF'
 local wezterm = require "wezterm"
 return {
-  enable_wayland = true,
+  enable_wayland = false,
   font = wezterm.font_with_fallback({
     "DejaVu Sans Mono",
     "Symbols Nerd Font Mono",
@@ -270,8 +271,8 @@ main(){
   sgdisk --zap-all "$DISK"
   sgdisk --clear "$DISK"
   sgdisk -n 1:0:+${ESP_SIZE_G} -t 1:ef00 "$DISK"
-  sgdisk -n 2:0:+${ROOT_SIZE_G} -t 2:8303 "$DISK"
-  sgdisk -n 3:0:+${HOME_SIZE_G} -t 3:8303 "$DISK"
+  sgdisk -n 2:0:+${ROOT_SIZE_G} -t 2:8309 "$DISK"
+  sgdisk -n 3:0:+${HOME_SIZE_G} -t 3:8309 "$DISK"
   sgdisk -p "$DISK"
   partprobe "$DISK" || true
   sleep 1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Arch Linux (Btrfs + LUKS), minimal install + Hyprland + ZRAM + Snapper
-# Prompts are in English to avoid TTY charset issues on the live ISO.
+# Arch Linux (Btrfs + LUKS) minimal install + Hyprland + ZRAM + Snapper
+# Prompts/messages are in English to avoid TTY charset issues on the live ISO.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -14,15 +14,12 @@ HOSTNAME="arch-pc"
 USERNAME="user404"
 USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
-
-# Mount opts influence what genfstab writes into /etc/fstab
-BTRFS_OPTS="noatime,compress=zstd:3,ssd,space_cache=v2"
-
-# Base + tools (added: curl, dbus, fontconfig for fc-cache)
+BTRFS_OPTS="noatime,compress=zstd"
 PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus fontconfig)
 
-# Hyprland config URL (your GitHub)
+# Config URLs (your GitHub)
 HYPRLAND_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
+WEZTERM_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/wezterm.lua"
 
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 fail(){ log "ERROR: $*" >&2; exit 1; }
@@ -89,9 +86,10 @@ pacman -Syu --noconfirm --needed \
   xdg-desktop-portal xdg-desktop-portal-hyprland \
   firefox wezterm \
   zram-generator snapper \
-  ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
+  ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu \
+  fontconfig
 
-# Rebuild font cache so GUI apps (wezterm) see fonts immediately
+# Rebuild font cache so wezterm sees fonts immediately
 fc-cache -f
 
 # User + sudo
@@ -129,6 +127,7 @@ editor no
 auto-entries yes
 EOF
 
+# Align boot options with fstab style (compress=zstd:3)
 cat >/boot/loader/entries/arch.conf <<EOF
 title   Arch Linux
 linux   /vmlinuz-linux
@@ -150,40 +149,35 @@ mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/timers.
 ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-user.target.wants/NetworkManager.service
 ln -sf /usr/lib/systemd/system/fstrim.timer        /etc/systemd/system/timers.target.wants/fstrim.timer
 
-# --- ZRAM via zram-generator (explicit size; no start in chroot) ---
-log "Configure zram-generator"
+# --- ZRAM via zram-generator (no start in chroot!) ---
+log "Configure zram-generator (explicit size)"
 cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-# Explicit size for maximum compatibility with generator versions
+# Explicit size for stable unit generation across versions
 zram-size = 16G
 compression-algorithm = zstd
 swap-priority = 100
 EOF
-# If some swap manager is present, disable it (ignore errors if absent)
+# If some other swap manager was installed by user later; harmless if absent
 systemctl disable --now systemd-swap.service 2>/dev/null || true
 
 # --- Snapper (create configs without DBus in chroot) ---
 log "Create Snapper configs via --no-dbus"
 install -d /.snapshots /home/.snapshots /etc/snapper/configs
-
-# Tie configs to actual mountpoints
 snapper --no-dbus -c root create-config /
 snapper --no-dbus -c home create-config /home
 
-# Align with minimal policy
+# Optional hardening to minimal policy
 sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/root
 sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'     /etc/snapper/configs/root
 sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/home
 sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'   /etc/snapper/configs/home
 
-# Make timers (if enabled later) aware of our configs
-if [[ -f /etc/conf.d/snapper ]]; then
-  sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root home"/' /etc/conf.d/snapper
-else
-  echo 'SNAPPER_CONFIGS="root home"' >/etc/conf.d/snapper
-fi
+# Let timers (if enabled later) know our configs (not strictly required)
+echo 'SNAPPER_CONFIGS="root home"' >/etc/conf.d/snapper
 
-log "Create oneshot service for baseline snapshots on first boot (no DBus)"
+# Oneshot to create baseline snapshots on first boot (also --no-dbus)
+log "Create oneshot for baseline snapshots (one-time)"
 cat >/etc/systemd/system/firstboot-snapper.service <<'EOF'
 [Unit]
 Description=Create initial Snapper snapshots (one-time)
@@ -201,15 +195,16 @@ WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/firstboot-snapper.service /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
 
-# --- Hyprland: create dirs and download your config ---
+# --- Hyprland & WezTerm configs from GitHub ---
 log "Hyprland: create directories and download your config"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/hypr"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/wezterm"
 
+# Hyprland config
 if curl -fsSL "${HYPRLAND_CONF_URL}" -o "/home/${USERNAME}/.config/hypr/hyprland.conf"; then
   chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
 else
-  # Fallback minimal config if download fails
+  # Fallback minimal config
   cat >"/home/${USERNAME}/.config/hypr/hyprland.conf" <<'EOF'
 monitor = ,preferred,auto,auto
 $terminal = wezterm
@@ -219,8 +214,12 @@ EOF
   chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
 fi
 
-# WezTerm config (fallback chain covers ascii/nerd/emoji)
-cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
+# WezTerm config
+if curl -fsSL "${WEZTERM_CONF_URL}" -o "/home/${USERNAME}/.config/wezterm/wezterm.lua"; then
+  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm/wezterm.lua"
+else
+  # Fallback that ensures font fallback & Wayland stability
+  cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
 local wezterm = require "wezterm"
 return {
   enable_wayland = false,
@@ -231,7 +230,8 @@ return {
   }),
 }
 EOF
-chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm"
+  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm/wezterm.lua"
+fi
 
 # Autostart Hyprland on tty1 only
 cat >"/home/${USERNAME}/.zprofile" <<'EOF'
@@ -342,6 +342,7 @@ TIMEZONE="${TIMEZONE}"
 UUID_ROOT_PART="${UUID_ROOT_PART}"
 UUID_HOME_PART="${UUID_HOME_PART}"
 HYPRLAND_CONF_URL="${HYPRLAND_CONF_URL}"
+WEZTERM_CONF_URL="${WEZTERM_CONF_URL}"
 EOF
 
   # --- Chroot phase ---

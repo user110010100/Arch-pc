@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Arch Linux (Btrfs + LUKS), minimal install + Hyprland + ZRAM + Snapper
-# Prompts in English. This script supersedes the previous version with small, targeted fixes.
+# Prompts are in English to avoid TTY charset issues on the live ISO.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -14,12 +14,11 @@ HOSTNAME="arch-pc"
 USERNAME="user404"
 USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
-BTRFS_OPTS="noatime,compress=zstd"  # base opts for mount during install
+BTRFS_OPTS="noatime,compress=zstd"
 PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus)
 
-# Hyprland & WezTerm configs
+# Hyprland config URL (your GitHub)
 HYPRLAND_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
-WEZTERM_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/%D0%9E%D1%82%D0%BA%D0%B0%D1%82/wezterm.lua"
 
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 fail(){ log "ERROR: $*" >&2; exit 1; }
@@ -128,13 +127,13 @@ title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options rd.luks.name=\${UUID_ROOT_PART}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd,discard=async rw nvidia-drm.modeset=1
+options rd.luks.name=${UUID_ROOT_PART}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
 EOF
 
 # --- crypttab for HOME (LUKS TRIM) ---
 log "Write /etc/crypttab for HOME"
 cat >/etc/crypttab <<EOF
-home    UUID=\${UUID_HOME_PART}    none    luks,discard
+home    UUID=${UUID_HOME_PART}    none    luks,discard
 EOF
 chmod 0600 /etc/crypttab
 
@@ -145,33 +144,34 @@ ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-
 ln -sf /usr/lib/systemd/system/fstrim.timer        /etc/systemd/system/timers.target.wants/fstrim.timer
 
 # --- ZRAM via zram-generator (no start in chroot!) ---
-# Fixed size avoids generator heuristics; ensure module autoloads at boot.
-log "Configure zram-generator (fixed size) and load module at boot"
+log "Configure zram-generator"
 cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-zram-size = 16G
+# Use up to RAM size, but cap it at 16G to avoid over-allocation on large RAM
+zram-fraction = 1.0
+max-zram-size = 16G
 compression-algorithm = zstd
 swap-priority = 100
 EOF
-install -d /etc/modules-load.d
-echo zram >/etc/modules-load.d/zram.conf
 systemctl disable --now systemd-swap.service 2>/dev/null || true
 
-# --- Snapper (create configs in chroot, DBus-less) ---
-log "Create Snapper configs for / and /home (no DBus)"
-# Ensure dirs exist (they are separate subvolumes already)
+# --- Snapper (no DBus calls in chroot) ---
+log "Create minimal Snapper configs for root/home"
 install -d /etc/snapper/configs
-snapper --no-dbus -c root create-config /
-snapper --no-dbus -c home create-config /home
+cat >/etc/snapper/configs/root <<'EOF'
+FSTYPE="btrfs"
+SUBVOLUME="/"
+TIMELINE_CREATE="no"
+NUMBER_CLEANUP="no"
+EOF
+cat >/etc/snapper/configs/home <<'EOF'
+FSTYPE="btrfs"
+SUBVOLUME="/home"
+TIMELINE_CREATE="no"
+NUMBER_CLEANUP="no"
+EOF
 
-# Align options with minimalist policy
-sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/root
-sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'     /etc/snapper/configs/root
-sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/home
-sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'   /etc/snapper/configs/home
-
-# One-shot at first boot to create baseline snapshots (when DBus is up)
-log "Install oneshot to create baseline snapshots at first boot"
+log "Create oneshot service to create baseline snapshots on first boot"
 cat >/etc/systemd/system/firstboot-snapper.service <<'EOF'
 [Unit]
 Description=Create initial Snapper snapshots (one-time)
@@ -189,7 +189,7 @@ WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/firstboot-snapper.service /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
 
-# --- Hyprland & WezTerm configs from GitHub ---
+# --- Hyprland: pull your config from GitHub ---
 log "Hyprland: create directories and download your config"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/hypr"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/wezterm"
@@ -197,7 +197,7 @@ install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/
 if curl -fsSL "${HYPRLAND_CONF_URL}" -o "/home/${USERNAME}/.config/hypr/hyprland.conf"; then
   chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
 else
-  # Fallback minimal config
+  # Fallback minimal config if download fails
   cat >"/home/${USERNAME}/.config/hypr/hyprland.conf" <<'EOF'
 monitor = ,preferred,auto,auto
 $terminal = wezterm
@@ -207,11 +207,8 @@ EOF
   chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
 fi
 
-# WezTerm config from your repo (Откат/wezterm.lua), with fallback
-if curl -fsSL "${WEZTERM_CONF_URL}" -o "/home/${USERNAME}/.config/wezterm/wezterm.lua"; then
-  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm/wezterm.lua"
-else
-  cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
+# WezTerm config (use XWayland for stability)
+cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
 local wezterm = require "wezterm"
 return {
   enable_wayland = false,
@@ -222,8 +219,7 @@ return {
   }),
 }
 EOF
-  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm/wezterm.lua"
-fi
+chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm"
 
 # Autostart Hyprland on tty1 only
 cat >"/home/${USERNAME}/.zprofile" <<'EOF'
@@ -323,16 +319,6 @@ main(){
   log "Generate fstab"
   genfstab -U /mnt >> /mnt/etc/fstab
 
-  # --- Normalize btrfs mount options in fstab (add discard=async, unify compress=zstd) ---
-  # 1) Drop any zstd level (e.g., :3) to plain compress=zstd
-  sed -i -E '/\tbtrfs\t/ s/compress=zstd(:[0-9]+)?/compress=zstd/g' /mnt/etc/fstab
-  # 2) If discard=async is absent and "ssd" is present, inject right after ssd
-  sed -i -E '/\tbtrfs\t/ {/discard=async/! s/,ssd(,|[[:space:]]|$)/,ssd,discard=async\1/}' /mnt/etc/fstab
-  # 3) If still absent (no ssd in options), inject after compress=zstd
-  sed -i -E '/\tbtrfs\t/ {/discard=async/! {/ssd/! s/compress=zstd/compress=zstd,discard=async/}}' /mnt/etc/fstab
-  # 4) Ensure space_cache=v2 present (genfstab usually adds it already)
-  grep -q 'space_cache=v2' /mnt/etc/fstab || sed -i -E '/\tbtrfs\t/ s/(subvol=[^ ,)]+)/\1,space_cache=v2/' /mnt/etc/fstab
-
   # --- Pass variables to chroot ---
   UUID_ROOT_PART=$(blkid -s UUID -o value "$P2")
   UUID_HOME_PART=$(blkid -s UUID -o value "$P3")
@@ -344,7 +330,6 @@ TIMEZONE="${TIMEZONE}"
 UUID_ROOT_PART="${UUID_ROOT_PART}"
 UUID_HOME_PART="${UUID_HOME_PART}"
 HYPRLAND_CONF_URL="${HYPRLAND_CONF_URL}"
-WEZTERM_CONF_URL="${WEZTERM_CONF_URL}"
 EOF
 
   # --- Chroot phase ---

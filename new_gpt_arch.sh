@@ -14,8 +14,12 @@ HOSTNAME="arch-pc"
 USERNAME="user404"
 USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
-BTRFS_OPTS="noatime,compress=zstd"
-PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus)
+
+# Mount opts influence what genfstab writes into /etc/fstab
+BTRFS_OPTS="noatime,compress=zstd:3,ssd,space_cache=v2"
+
+# Base + tools (added: curl, dbus, fontconfig for fc-cache)
+PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus fontconfig)
 
 # Hyprland config URL (your GitHub)
 HYPRLAND_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
@@ -87,6 +91,9 @@ pacman -Syu --noconfirm --needed \
   zram-generator snapper \
   ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
 
+# Rebuild font cache so GUI apps (wezterm) see fonts immediately
+fc-cache -f
+
 # User + sudo
 if ! id -u "${USERNAME}" >/dev/null 2>&1; then
   useradd -m -G wheel -s "${USER_SHELL}" "${USERNAME}"
@@ -127,7 +134,7 @@ title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options rd.luks.name=${UUID_ROOT_PART}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
+options rd.luks.name=${UUID_ROOT_PART}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd:3 rw nvidia-drm.modeset=1
 EOF
 
 # --- crypttab for HOME (LUKS TRIM) ---
@@ -143,45 +150,50 @@ mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/timers.
 ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-user.target.wants/NetworkManager.service
 ln -sf /usr/lib/systemd/system/fstrim.timer        /etc/systemd/system/timers.target.wants/fstrim.timer
 
-# --- ZRAM via zram-generator (no start in chroot!) ---
+# --- ZRAM via zram-generator (explicit size; no start in chroot) ---
 log "Configure zram-generator"
 cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-# Use up to RAM size, but cap it at 16G to avoid over-allocation on large RAM
-zram-fraction = 1.0
-max-zram-size = 16G
+# Explicit size for maximum compatibility with generator versions
+zram-size = 16G
 compression-algorithm = zstd
 swap-priority = 100
 EOF
+# If some swap manager is present, disable it (ignore errors if absent)
 systemctl disable --now systemd-swap.service 2>/dev/null || true
 
-# --- Snapper (no DBus calls in chroot) ---
-log "Create minimal Snapper configs for root/home"
-install -d /etc/snapper/configs
-cat >/etc/snapper/configs/root <<'EOF'
-FSTYPE="btrfs"
-SUBVOLUME="/"
-TIMELINE_CREATE="no"
-NUMBER_CLEANUP="no"
-EOF
-cat >/etc/snapper/configs/home <<'EOF'
-FSTYPE="btrfs"
-SUBVOLUME="/home"
-TIMELINE_CREATE="no"
-NUMBER_CLEANUP="no"
-EOF
+# --- Snapper (create configs without DBus in chroot) ---
+log "Create Snapper configs via --no-dbus"
+install -d /.snapshots /home/.snapshots /etc/snapper/configs
 
-log "Create oneshot service to create baseline snapshots on first boot"
+# Tie configs to actual mountpoints
+snapper --no-dbus -c root create-config /
+snapper --no-dbus -c home create-config /home
+
+# Align with minimal policy
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/root
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'     /etc/snapper/configs/root
+sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' /etc/snapper/configs/home
+sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="no"/'   /etc/snapper/configs/home
+
+# Make timers (if enabled later) aware of our configs
+if [[ -f /etc/conf.d/snapper ]]; then
+  sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root home"/' /etc/conf.d/snapper
+else
+  echo 'SNAPPER_CONFIGS="root home"' >/etc/conf.d/snapper
+fi
+
+log "Create oneshot service for baseline snapshots on first boot (no DBus)"
 cat >/etc/systemd/system/firstboot-snapper.service <<'EOF'
 [Unit]
 Description=Create initial Snapper snapshots (one-time)
-After=local-fs.target network.target
+After=local-fs.target
 ConditionPathExists=/etc/snapper/configs/root
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/snapper -c root create --description "baseline-0"
-ExecStart=/usr/bin/snapper -c home create --description "baseline-0-home"
+ExecStart=/usr/bin/snapper --no-dbus -c root create --description "baseline-0"
+ExecStart=/usr/bin/snapper --no-dbus -c home create --description "baseline-0-home"
 ExecStartPost=/usr/bin/systemctl disable --now firstboot-snapper.service
 
 [Install]
@@ -189,7 +201,7 @@ WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/firstboot-snapper.service /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
 
-# --- Hyprland: pull your config from GitHub ---
+# --- Hyprland: create dirs and download your config ---
 log "Hyprland: create directories and download your config"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/hypr"
 install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/wezterm"
@@ -207,7 +219,7 @@ EOF
   chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
 fi
 
-# WezTerm config (use XWayland for stability)
+# WezTerm config (fallback chain covers ascii/nerd/emoji)
 cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
 local wezterm = require "wezterm"
 return {

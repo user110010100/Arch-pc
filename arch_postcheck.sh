@@ -1,245 +1,342 @@
 #!/usr/bin/env zsh
-# Post-install checks for Arch + Hyprland + zram-generator + Snapper + WezTerm
-# Read-only diagnostics; prints PASS/FAIL for key fixes.
+# Post-install verification for Arch + Hyprland + zram-generator + Snapper + WezTerm
+# Read-only checks. Prints PASS/WARN/FAIL and writes a log to ~/arch_check.log
 
-# --------- tiny ui helpers ----------
+set -o pipefail
+set -u
+
+# ---------- tiny UI helpers ----------
 autoload -Uz colors; colors
 _ok()   { print -P "%F{green}[PASS]%f $*"; }
 _warn() { print -P "%F{yellow}[WARN]%f $*"; }
 _fail() { print -P "%F{red}[FAIL]%f $*"; }
 _info() { print -P "%F{cyan}==%f $*"; }
 
-print -P "%F{blue}Arch post-install validation (zram/snapper/wezterm)%f"
+LOG_FILE="${HOME}/arch_check.log"
+: > "${LOG_FILE}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+print -P "%F{blue}Arch post-install validation (zram, snapper, fonts, wezterm)%f"
 print
 
-# =========================
-# 1) CORE SYSTEM FILES
-# =========================
-_info "/etc/os-release"; cat /etc/os-release
-_info "Kernel"; uname -r
-
-_info "/etc/fstab"; sudo sed -n '1,200p' /etc/fstab
-_info "bootctl status"; sudo bootctl status --no-pager || _warn "bootctl status returned non-zero"
-_info "/boot/loader/loader.conf"; sudo sed -n '1,200p' /boot/loader/loader.conf
-_info "/boot/loader/entries (list)"; sudo ls -l /boot/loader/entries
-_info "/boot/loader/entries/arch.conf"; sudo sed -n '1,200p' /boot/loader/entries/arch.conf
-_info "/etc/crypttab"; sudo sed -n '1,200p' /etc/crypttab
-_info "/etc/mkinitcpio.conf"; sudo sed -n '1,200p' /etc/mkinitcpio.conf
-_info "/etc/systemd/zram-generator.conf"; sudo sed -n '1,200p' /etc/systemd/zram-generator.conf
-_info "/etc/locale.conf"; cat /etc/locale.conf
-_info "/etc/vconsole.conf"; cat /etc/vconsole.conf
-_info "/etc/hostname"; cat /etc/hostname
-
-_info "NetworkManager enablement/status"
-if systemctl is-enabled NetworkManager &>/dev/null; then
-  _ok "NetworkManager is enabled"
-else
-  _fail "NetworkManager is NOT enabled"
-fi
-systemctl status --no-pager -n 20 NetworkManager || true
-
-_info "Block devices & filesystems"
-lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,UUID
-
-_info "Btrfs subvolumes: /"
-sudo btrfs subvolume list -p /
-if mount | grep -q " /home "; then
-  _info "Btrfs subvolumes: /home"
-  sudo btrfs subvolume list -p /home
-fi
-
-_info "Installer variables (if present)"
-sudo sed -n '1,200p' /root/install-vars 2>/dev/null || print "No /root/install-vars"
-
-# Consistency: compress=zstd:3 in both fstab and arch.conf
-typeset fstab_ok arch_ok
-fstab_ok=$(grep -E 'compress=zstd:3' /etc/fstab | wc -l)
-arch_ok=$(grep -E 'rootflags=.*compress=zstd:3' /boot/loader/entries/arch.conf | wc -l)
-(( fstab_ok > 0 )) && _ok "fstab uses compress=zstd:3" || _warn "fstab does not show compress=zstd:3"
-(( arch_ok  > 0 )) && _ok "arch.conf uses compress=zstd:3" || _warn "arch.conf does not show compress=zstd:3"
-
+# =====================================================
+# 0) BASIC CONTEXT
+# =====================================================
+_info "System context"
+print "Kernel:       $(uname -r)"
+print "Hostname:     $(hostname)"
+print "User:         ${USER}"
+print "Shell:        ${SHELL}"
 print
 
-# =================================
-# 2) SNAPPER: CONFIGS & SNAPSHOTS
-# =================================
-_info "Snapper configs directory"; sudo ls -l /etc/snapper/configs/ || _fail "/etc/snapper/configs/ is missing"
-
-if [[ -f /etc/snapper/configs/root && -f /etc/snapper/configs/home ]]; then
-  _ok "Snapper configs found: root & home"
+# =====================================================
+# 1) ZRAM (via systemd zram-generator)
+#    Задачи:
+#    - Проверить наличие /etc/systemd/zram-generator.conf
+#    - Убедиться, что /dev/zram0 создан, swap активен
+#    - Алгоритм сжатия = zstd
+#    - Размер zram = 1/2 RAM (+/- 5%)
+#    - Подсветить, если включен zswap (не критично, но полезно знать)
+# =====================================================
+_info "ZRAM status"
+if [[ -r /etc/systemd/zram-generator.conf ]]; then
+  _ok "Found /etc/systemd/zram-generator.conf"
+  print "--- zram-generator.conf ---"
+  sed -n '1,120p' /etc/systemd/zram-generator.conf
 else
-  _fail "Snapper configs missing (root/home)"
+  _warn "No /etc/systemd/zram-generator.conf"
 fi
-
-_info "snapper list-configs"
-sudo snapper list-configs || _warn "snapper list-configs returned non-zero"
-
-_info "snapper -c root list"
-if sudo snapper -c root list; then
-  if sudo snapper -c root list | grep -q "baseline-0"; then
-    _ok "root baseline snapshot exists"
-  else
-    _warn "root baseline snapshot not found (service may not have run yet)"
-  fi
-else
-  _fail "snapper root config not usable"
-fi
-
-_info "snapper -c home list"
-if sudo snapper -c home list; then
-  if sudo snapper -c home list | grep -q "baseline-0-home"; then
-    _ok "home baseline snapshot exists"
-  else
-    _warn "home baseline snapshot not found (service may not have run yet)"
-  fi
-else
-  _fail "snapper home config not usable"
-fi
-
-_info "firstboot-snapper.service status (should be disabled after running once)"
-if systemctl is-enabled firstboot-snapper.service &>/dev/null; then
-  _warn "firstboot-snapper.service is still enabled (expected disabled after one run)"
-else
-  _ok "firstboot-snapper.service is not enabled (as expected after one run)"
-fi
-systemctl status --no-pager firstboot-snapper.service || true
-_info "firstboot-snapper journal (this boot)"; journalctl -b -u firstboot-snapper.service --no-pager || true
-
-_info "Snapshot dirs"
-sudo ls -la /.snapshots
-sudo ls -la /home/.snapshots
-
 print
 
-# ================================
-# 3) ZRAM: STATE & PARAMETERS
-# ================================
-_info "zram generator artifacts (should exist at boot)"
-ls /run/systemd/generator/*zram* /run/systemd/generator.late/*zram* 2>/dev/null || _warn "no generator artifacts visible (ok if cleaned later)"
-
-_info "dev-zram0.swap unit"
-if systemctl is-active --quiet dev-zram0.swap; then
-  _ok "dev-zram0.swap is active"
+# Показать статусы сервисов и swap; это только диагностика
+if systemctl status dev-zram0.swap >/dev/null 2>&1; then
+  _ok "dev-zram0.swap unit exists"
 else
-  systemctl status --no-pager dev-zram0.swap || true
-  _fail "dev-zram0.swap is NOT active"
+  _warn "dev-zram0.swap unit not present"
 fi
 
-_info "systemd-zram-setup@zram0.service journal (this boot)"
-journalctl -b -u systemd-zram-setup@zram0.service --no-pager || true
-
-_info "Active swaps (expect /dev/zram0)"
-swapon --show --bytes
-if swapon --show | grep -q "/dev/zram0"; then
-  _ok "zram0 is active swap"
+if systemctl status systemd-zram-setup@zram0.service >/dev/null 2>&1; then
+  _ok "systemd-zram-setup@zram0.service reachable"
 else
-  _fail "zram0 not found in /proc/swaps"
+  _warn "systemd-zram-setup@zram0.service not found"
 fi
 
-_info "zramctl details"; sudo zramctl || _warn "zramctl returned non-zero"
+print
+zramctl || true
+print
+swapon --show --bytes || true
+print
+
+# Проверка: алгоритм = zstd (в /sys/block/zram0/comp_algorithm текущий отмечен [квадратными])
 if [[ -r /sys/block/zram0/comp_algorithm ]]; then
-  _ok "comp_algorithm: $(< /sys/block/zram0/comp_algorithm)"
+  comp_line="$(< /sys/block/zram0/comp_algorithm)"
+  print "comp_algorithm: ${comp_line}"
+  if print -- "${comp_line}" | grep -q '\[zstd\]'; then
+    _ok "ZRAM compression is zstd"
+  else
+    _fail "ZRAM compression is NOT zstd"
+  fi
 else
-  _warn "/sys/block/zram0/comp_algorithm not present"
-fi
-if [[ -r /sys/block/zram0/disksize ]]; then
-  _ok "disksize: $(< /sys/block/zram0/disksize)"
-fi
-print
-
-# ==============================================
-# 4) FONTS & WEZTERM
-# ==============================================
-_info "Fontconfig defaults (fallback)"
-print "monospace -> $(fc-match monospace)"
-print "sans      -> $(fc-match sans)"
-print "serif     -> $(fc-match serif)"
-
-_info "Check presence of key fonts (Noto/DejaVu/Nerd Symbols)"
-fc-list | grep -Ei '(Noto|DejaVu|Symbols Nerd)' | sort | uniq | head -n 50
-
-# Verify wezterm binary and version
-if command -v wezterm >/dev/null 2>&1; then
-  _ok "wezterm in PATH: $(wezterm --version 2>/dev/null)"
-else
-  _fail "wezterm not found in PATH"
+  _warn "No /sys/block/zram0/comp_algorithm (zram0 may be absent)"
 fi
 
-# Local config presence
-WEZ_LOCAL="$HOME/.config/wezterm/wezterm.lua"
-_info "WezTerm config (local)"; ls -l -- $WEZ_LOCAL 2>/dev/null || _fail "No $WEZ_LOCAL"
-[[ -r $WEZ_LOCAL ]] && sed -n '1,120p' -- $WEZ_LOCAL
-
-# Compare local wezterm.lua with remote (download to tmp; read-only)
-REMOTE_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/wezterm.lua"
-if command -v curl >/dev/null 2>&1; then
-  _info "Comparing local wezterm.lua with remote (hash only)"
-  tmpf="$(mktemp)"
-  if curl -fsSL "$REMOTE_URL" -o "$tmpf"; then
-    local_hash=$(sha256sum -- "$WEZ_LOCAL" 2>/dev/null | awk '{print $1}')
-    remote_hash=$(sha256sum -- "$tmpf" | awk '{print $1}')
-    if [[ -n "$local_hash" && "$local_hash" == "$remote_hash" ]]; then
-      _ok "wezterm.lua matches remote (sha256: $local_hash)"
+# Проверка: размер zram0 ~ 1/2 RAM (+/- 5%)
+if command -v zramctl >/dev/null 2>&1 && [[ -e /dev/zram0 ]]; then
+  # Получаем MemTotal в KiB
+  mem_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+  if [[ -n "${mem_kib:-}" ]]; then
+    # Ожидаемый размер в байтах = 1/2 RAM
+    expected_bytes=$(( mem_kib * 1024 / 2 ))
+    # Фактический размер zram0 (в байтах; ключ -b выдаёт байты)
+    actual_bytes=$(zramctl -b 2>/dev/null | awk '$1 ~ /zram0/ {print $3; exit}')
+    if [[ -n "${actual_bytes:-}" ]]; then
+      # Допустимое отклонение = 5%
+      low=$(( expected_bytes * 95 / 100 ))
+      high=$(( expected_bytes * 105 / 100 ))
+      print "RAM total:      $((mem_kib / 1024)) MiB"
+      print "Expected zram:  $((expected_bytes / 1024 / 1024)) MiB"
+      print "Actual zram:    $((actual_bytes / 1024 / 1024)) MiB"
+      if (( actual_bytes >= low && actual_bytes <= high )); then
+        _ok "zram size ≈ 1/2 RAM"
+      else
+        _warn "zram size is outside ±5% of 1/2 RAM"
+      fi
     else
-      _warn "wezterm.lua differs from remote (local: $local_hash vs remote: $remote_hash)"
+      _fail "Cannot read zram0 size"
     fi
   else
-    _warn "cannot fetch remote wezterm.lua for comparison"
+    _warn "Cannot read MemTotal from /proc/meminfo"
   fi
-  rm -f -- "$tmpf"
 else
-  _warn "curl not available; skipping remote wezterm.lua comparison"
+  _warn "zramctl not available or /dev/zram0 missing"
 fi
 
-# WezTerm font visibility (if wezterm is available)
-if command -v wezterm >/dev/null 2>&1; then
-  _info "WezTerm sees system fonts (first 50 lines)"
-  wezterm ls-fonts --list-system --no-colors | head -n 50 || _warn "wezterm ls-fonts returned non-zero"
+# Подсветим zswap (для понимания, а не как ошибку)
+if [[ -r /sys/module/zswap/parameters/enabled ]]; then
+  zswap_state="$(< /sys/module/zswap/parameters/enabled)"
+  _info "zswap: ${zswap_state}"
+fi
+print
 
-  _info "WezTerm glyph coverage sample"
-  wezterm ls-fonts --text "→ Hello Привет 😀" --no-colors | head -n 50 || true
+# =====================================================
+# 2) SNAPPER
+#    Задачи:
+#    - Есть ли конфиги (root/home) и в SNAPPER_CONFIGS
+#    - Снимки читаются (snapper -c root/home list)
+#    - Таймеры timeline/cleanup включены
+#    - /.snapshots и /home/.snapshots смонтированы отдельными сабвольюмами btrfs
+#    - Базовые ключи в конфиге (TIMELINE_CREATE, NUMBER_CLEANUP, SYNC_ACL, ALLOW_GROUPS)
+# =====================================================
+_info "Snapper status"
+if ! command -v snapper >/dev/null 2>&1; then
+  _fail "snapper is not installed"
+else
+  snapper list-configs || true
+  print
 
-  # Grep for our expected fonts in the wezterm-visible list
-  if wezterm ls-fonts --list-system --no-colors | grep -qi 'DejaVu Sans Mono'; then
-    _ok "WezTerm sees DejaVu Sans Mono"
-  else
-    _warn "WezTerm does NOT list DejaVu Sans Mono"
+  # SNAPPER_CONFIGS (Arch)
+  if [[ -r /etc/conf.d/snapper ]]; then
+    grep -E '^SNAPPER_CONFIGS=' /etc/conf.d/snapper || true
   fi
-  if wezterm ls-fonts --list-system --no-colors | grep -qi 'Symbols Nerd'; then
-    _ok "WezTerm sees Symbols Nerd Font"
+  print
+
+  for cfg in root home; do
+    if snapper -c "$cfg" get-config >/dev/null 2>&1; then
+      _ok "Snapper config '$cfg' exists"
+      print "--- snapper $cfg get-config ---"
+      snapper -c "$cfg" get-config | sed 's/^/  /'
+      print "--- latest snapshots ($cfg) ---"
+      snapper -c "$cfg" list | tail -n 10 | sed 's/^/  /'
+    else
+      _warn "Snapper config '$cfg' not found"
+    fi
+    print
+  done
+
+  # Таймеры
+  for t in snapper-timeline.timer snapper-cleanup.timer; do
+    if systemctl is-enabled "$t" >/dev/null 2>&1; then
+      _ok "$t is enabled"
+    else
+      _warn "$t is NOT enabled"
+    fi
+  done
+  print "== timers overview =="
+  systemctl list-timers | grep -E 'snapper-(timeline|cleanup)\.timer' || true
+fi
+print
+
+# Проверка точек монтирования .snapshots
+_info "Check .snapshots mountpoints"
+for p in /.snapshots /home/.snapshots; do
+  if findmnt -no FSTYPE,SOURCE,OPTIONS "$p" >/dev/null 2>&1; then
+    line="$(findmnt -no FSTYPE,SOURCE,OPTIONS "$p")"
+    print "$p -> $line"
+    if print -- "$line" | grep -q '^btrfs'; then
+      _ok "$p is on btrfs (good)"
+    else
+      _warn "$p is not on btrfs"
+    fi
   else
-    _warn "WezTerm does NOT list Symbols Nerd Font"
+    _warn "Mountpoint $p not found"
+  fi
+done
+print
+
+# =====================================================
+# 3) FSTAB sanity for btrfs (quick glance)
+#    Задачи:
+#    - Убедиться, что корень/снэпшоты используют btrfs и сжатие zstd:* (быстрое подтверждение)
+# =====================================================
+_info "fstab quick check (btrfs + zstd)"
+if [[ -r /etc/fstab ]]; then
+  grep -E '^\s*[^#].*\s+btrfs\s' /etc/fstab | sed 's/^/  /' || true
+  if grep -E '^\s*[^#].*\s+btrfs\s' /etc/fstab | grep -q 'compress=zstd'; then
+    _ok "btrfs entries use zstd compression"
+  else
+    _warn "No 'compress=zstd' found in btrfs entries"
+  fi
+else
+  _warn "No /etc/fstab"
+fi
+print
+
+# =====================================================
+# 4) FONTS (system via fontconfig) + WEZTERM fonts
+#    Задачи:
+#    - Показать дефолтные соответствия для generic семейств (sans-serif, monospace, serif)
+#    - Показать 5 верхних fallback’ов
+#    - Разобрать конфиг wezterm.lua (font()/font_with_fallback{})
+#    - Проверить, что семьи из конфига реально установлены
+#    - Если доступен 'wezterm', показать, видит ли он эти семьи, и подсветить Noto Color Emoji
+# =====================================================
+_info "Fontconfig defaults"
+if command -v fc-match >/dev/null 2>&1; then
+  for fam in "sans-serif" "monospace" "serif"; do
+    print "-- fc-match ${fam} --"
+    fc-match "${fam}"
+    print "-- fallback chain (top 5) for ${fam} --"
+    fc-match -s "${fam}" | head -n 5 | sed 's/^/  /'
+    print
+  done
+else
+  _warn "fontconfig tools (fc-match) not installed"
+fi
+
+# Найдём конфиг WezTerm
+_info "WezTerm font settings"
+WEZTERM_CFG=""
+if [[ -n "${WEZTERM_CONFIG_FILE:-}" && -r "${WEZTERM_CONFIG_FILE}" ]]; then
+  WEZTERM_CFG="${WEZTERM_CONFIG_FILE}"
+elif [[ -r "${HOME}/.config/wezterm/wezterm.lua" ]]; then
+  WEZTERM_CFG="${HOME}/.config/wezterm/wezterm.lua"
+elif [[ -r "${HOME}/.wezterm.lua" ]]; then
+  WEZTERM_CFG="${HOME}/.wezterm.lua"
+fi
+
+if [[ -n "${WEZTERM_CFG}" ]]; then
+  _ok "Found WezTerm config: ${WEZTERM_CFG}"
+  print "--- snippet (head) ---"
+  sed -n '1,120p' "${WEZTERM_CFG}"
+  print
+
+  # Извлечём семьи: сначала font_with_fallback{'A','B',...}, затем font("X")
+  local -a WZ_FONTS
+  WZ_FONTS=()
+
+  # 1) font_with_fallback { 'A', "B", ... }
+  #    Извлекаем содержимое фигурных скобок и тянем все строковые литералы
+  if grep -qE 'font_with_fallback\s*\{' "${WEZTERM_CFG}"; then
+    fonts_raw=$(sed -n 's/.*font_with_fallback\s*{\(.*\)}.*/\1/p' "${WEZTERM_CFG}" | head -n1)
+    if [[ -n "${fonts_raw}" ]]; then
+      # Вытащим все "..." и '...'
+      while read -r name; do
+        [[ -n "${name}" ]] && WZ_FONTS+=("${name}")
+      done < <(print -- "${fonts_raw}" | grep -oE "'[^']+'|\"[^\"]+\"" | sed "s/^['\"]//; s/['\"]$//")
+    fi
+  fi
+
+  # 2) Если не нашли fallback — попробуем font("X")
+  if [[ ${#WZ_FONTS[@]} -eq 0 ]]; then
+    single=$(sed -n 's/.*font\s*(\s*["'\'']\([^"'\'' ]\+\)["'\''].*).*/\1/p' "${WEZTERM_CFG}" | head -n1)
+    [[ -n "${single}" ]] && WZ_FONTS+=("${single}")
+  fi
+
+  if [[ ${#WZ_FONTS[@]} -gt 0 ]]; then
+    _ok "WezTerm configured font(s): ${WZ_FONTS[@]}"
+  else
+    _warn "No explicit font configured in WezTerm; using default"
+  fi
+
+  # Проверим, установлены ли такие семейства в системе (fc-list)
+  if command -v fc-list >/dev/null 2>&1 && [[ ${#WZ_FONTS[@]} -gt 0 ]]; then
+    for fam in "${WZ_FONTS[@]}"; do
+      if fc-list ":family=${fam}" >/dev/null 2>&1 && fc-list ":family=${fam}" | head -n1 | grep -qi .; then
+        _ok "Font family '${fam}' is installed (fontconfig can find it)"
+      else
+        _fail "Font family '${fam}' is NOT installed (fontconfig cannot find it)"
+      fi
+    done
+  fi
+else
+  _warn "WezTerm config not found"
+fi
+print
+
+# Если доступен wezterm — проверим видимость семейств и Noto Color Emoji
+if command -v wezterm >/dev/null 2>&1; then
+  _info "wezterm ls-fonts (system)"
+  # Короткая выборка, чтобы не заливать лог
+  wezterm ls-fonts --list-system --no-colors | head -n 25 || true
+
+  # Если у нас есть конкретные семьи из конфига — проверим, что wezterm их видит
+  if [[ ${#WZ_FONTS[@]:-0} -gt 0 ]]; then
+    for fam in "${WZ_FONTS[@]}"; do
+      if wezterm ls-fonts --list-system --no-colors | grep -qiE "^\s*family:\s*${fam}\b"; then
+        _ok "WezTerm sees family '${fam}'"
+      else
+        _warn "WezTerm does NOT list family '${fam}'"
+      fi
+    done
+  fi
+
+  # Эмодзи-шрифт
+  if fc-list | grep -qi "NotoColorEmoji"; then
+    _ok "System has Noto Color Emoji"
+  else
+    _warn "System does NOT have Noto Color Emoji"
   fi
   if wezterm ls-fonts --list-system --no-colors | grep -qi 'Noto Color Emoji'; then
     _ok "WezTerm sees Noto Color Emoji"
   else
     _warn "WezTerm does NOT list Noto Color Emoji"
   fi
+else
+  _warn "wezterm CLI not found; skipping wezterm ls-fonts checks"
 fi
 print
 
 # =====================================================
-# 5) INSTALLER LOGS (IF ANY)
+# 5) OPTIONAL: BTRFS subvol overview (quick)
 # =====================================================
-_info "Try to print any installer logs if present"
+_info "btrfs subvolumes (top)"
+if command -v btrfs >/dev/null 2>&1; then
+  sudo btrfs subvolume list -t / 2>/dev/null | head -n 30 | sed 's/^/  /' || true
+else
+  _warn "btrfs-progs not installed"
+fi
+print
+
+# =====================================================
+# 6) OPTIONAL: Installer logs (if any)
+# =====================================================
+_info "Installer logs (if present)"
 for f in /root/arch_install.log /var/log/arch_install.log /root/install.log ; do
   if [[ -s "$f" ]]; then
-    print -- "-- $f --"
-    sudo sed -n '1,200p' -- "$f"
+    print "--- $f (tail) ---"
+    sudo tail -n 60 "$f" | sed 's/^/  /'
   fi
 done
-
-_info "chroot_setup.sh saved by installer (for reference)"
-sudo sed -n '1,120p' /root/chroot_setup.sh 2>/dev/null || print "No /root/chroot_setup.sh"
-
-# (Optional) NVIDIA check
-_info "NVIDIA modules & tools (optional)"
-lsmod | grep -i nvidia || true
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi || true
-else
-  print "nvidia-smi not available/runlevel not graphical"
-fi
-
 print
-_ok "Checks finished."
+
+_ok "All checks finished. Log saved to ${LOG_FILE}"

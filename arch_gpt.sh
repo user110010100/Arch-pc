@@ -18,10 +18,10 @@ USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
 
 # Важно: согласно вашим требованиям к монтированию Btrfs
-BTRFS_OPTS="rw,noatime,compress=zstd,ssd,discard=async,space_cache=v2"
+BTRFS_OPTS="noatime,compress=zstd"
 
 # Пакеты базовой системы
-PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl)
+PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus fontconfig)
 
 # URLs ваших конфигов
 HYPRLAND_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"

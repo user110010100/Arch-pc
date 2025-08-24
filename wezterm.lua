@@ -1,36 +1,53 @@
 local wezterm = require 'wezterm'
 
+-- Безопасная загрузка шрифтов с fallback
+local primary_font = 'FiraCode Nerd Font Mono'
+local fallback_fonts = {
+  'Noto Sans Cyrillic',
+  'Noto Color Emoji',
+  'DejaVu Sans Mono',
+}
+
+-- Проверяем доступность основного шрифта
+local font_list = {primary_font}
+for _, font in ipairs(fallback_fonts) do
+  table.insert(font_list, font)
+end
+
 return {
   -- Явное отключение Wayland-бэкенда для совместимости с Hyprland
   enable_wayland = false,
 
   -- Настройки шрифтов с приоритетом FiraCode Nerd Font
-  font = wezterm.font_with_fallback({
-    'FiraCode Nerd Font',
-    'Noto Sans Cyrillic',
-    'Noto Color Emoji',
-    'DejaVu Sans Mono',
-  }),
+  font = wezterm.font_with_fallback(font_list),
   font_size = 12.0,
 
   -- Дополнительные настройки шрифтов
   font_rules = {
     {
       italic = true,
-      font = wezterm.font('FiraCode Nerd Font', {italic = true}),
+      font = wezterm.font(primary_font, {italic = true}),
     },
   },
   warn_about_missing_glyphs = false,
   font_shaping = 'Harfbuzz',
 
+  -- Автоматическое копирование при выделении
+  selection_automatically_copy_to_clipboard = true,
 
   -- Настройки мыши
   mouse_bindings = {
-    -- Выделение и мгновенное копирование в буфер
+    -- Выделение текста
     {
-      event = { Drag = { streak = 1, button = 'Left' } },
+      event = { Down = { streak = 1, button = 'Left' } },
       mods = 'NONE',
-      action = wezterm.action { SelectText = 'ClipboardAndPrimarySelection' },
+      action = wezterm.action { SelectTextAtMouseCursor = 'Cell' },
+    },
+    -- Завершение выделения (копирование происходит автоматически)
+    {
+      event = { Up = { streak = 1, button = 'Left' } },
+      mods = 'NONE',
+      action = wezterm.action { CompleteSelection = 'Clipboard' },
     },
     -- Вставка по правой кнопке
     {
@@ -57,7 +74,6 @@ return {
   },
 
   -- Дополнительные настройки
-  warn_about_missing_glyphs = false,
   enable_kitty_keyboard = true,
   hide_mouse_cursor_when_typing = false,
   default_cursor_style = 'BlinkingBlock',

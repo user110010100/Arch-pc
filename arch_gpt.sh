@@ -169,48 +169,73 @@ ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-
 ln -sf /usr/lib/systemd/system/fstrim.timer        /etc/systemd/system/timers.target.wants/fstrim.timer
 
 # ---------- ZRAM (zram-generator) ----------
-log "Writing zram-generator config (no service start in chroot)"
-cat >/etc/systemd/zram-generator.conf <<'EOF'
+log "Writing zram-generator config (ram/2, zstd)"
+
+# Конфиг создаём атомарно; размер как половина физической RAM; компрессор zstd; высокий приоритет
+install -Dm644 /dev/stdin /etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-zram-size = 16G
+# Размер задаётся от физической RAM: безопаснее и гибче, чем фиксированные "16G"
+zram-size = ram / 2
+# Оптимальный компрессор по соотношению скорость/сжатие
 compression-algorithm = zstd
+# Использовать zram раньше любых дисковых swap
 swap-priority = 100
 EOF
+
+# На всякий случай отключаем устаревшие менеджеры swap, если вдруг стоят
 systemctl disable --now systemd-swap.service 2>/dev/null || true
 
-# ---------- Snapper minimal configs + first-boot snapshots ----------
-log "Creating minimal Snapper configs"
-install -d /etc/snapper/configs
-cat >/etc/snapper/configs/root <<'EOF'
-FSTYPE="btrfs"
-SUBVOLUME="/"
-TIMELINE_CREATE="no"
-NUMBER_CLEANUP="no"
-EOF
-cat >/etc/snapper/configs/home <<'EOF'
-FSTYPE="btrfs"
-SUBVOLUME="/home"
-TIMELINE_CREATE="no"
-NUMBER_CLEANUP="no"
-EOF
+# ---------- Snapper: proper configs + timers + first-boot baseline ----------
+log "Configuring Snapper (create-config + set-config + timers)"
 
+# 1) Создаём конфиги штатным способом (в chroot без DBus)
+install -d /etc/snapper/configs
+
+# root (снимки для сабвольюма /)
+snapper --no-dbus -c root create-config /
+
+# home (если хочешь таймлайн и для /home)
+snapper --no-dbus -c home create-config /home
+
+# 2) Подкрутка параметров: таймлайн/очистка/ACL/доступ группе wheel
+snapper --no-dbus -c root set-config \
+  "TIMELINE_CREATE=yes" "NUMBER_CLEANUP=yes" "SYNC_ACL=yes" "ALLOW_GROUPS=wheel"
+
+snapper --no-dbus -c home set-config \
+  "TIMELINE_CREATE=yes" "NUMBER_CLEANUP=yes" "SYNC_ACL=yes" "ALLOW_GROUPS=wheel"
+
+# 3) Права на каталоги .snapshots (ACL синхронизируются, каталоги — под root)
+chmod 750 /.snapshots         2>/dev/null || true
+chmod 750 /home/.snapshots    2>/dev/null || true
+
+# 4) Включаем таймеры Snapper без systemctl (как ты делаешь с другими сервисами)
+mkdir -p /etc/systemd/system/timers.target.wants
+ln -sf /usr/lib/systemd/system/snapper-timeline.timer /etc/systemd/system/timers.target.wants/snapper-timeline.timer
+ln -sf /usr/lib/systemd/system/snapper-cleanup.timer  /etc/systemd/system/timers.target.wants/snapper-cleanup.timer
+
+# 5) Оставляем инициализацию baseline-снимков твоим oneshot-сервисом на первом буте
 log "Installing oneshot to create baseline snapshots on first boot"
 cat >/etc/systemd/system/firstboot-snapper.service <<'EOF'
 [Unit]
 Description=Create initial Snapper snapshots (one-time)
 After=local-fs.target network.target
+# Конфиг root уже существует к первому буту
 ConditionPathExists=/etc/snapper/configs/root
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/snapper -c root create --description "baseline-0"
 ExecStart=/usr/bin/snapper -c home create --description "baseline-0-home"
+# Отключаем себя после выполнения
 ExecStartPost=/usr/bin/systemctl disable --now firstboot-snapper.service
 
 [Install]
 WantedBy=multi-user.target
 EOF
-ln -sf /etc/systemd/system/firstboot-snapper.service /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
+
+# enable через wanted-симлинк (в твоём стиле)
+ln -sf /etc/systemd/system/firstboot-snapper.service \
+      /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
 
 # ---------- Hyprland & WezTerm конфиги (скачиваем с GitHub с фолбэком) ----------
 log "Preparing Hyprland/WezTerm configs"

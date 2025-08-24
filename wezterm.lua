@@ -1,20 +1,16 @@
 local wezterm = require 'wezterm'
 
 return {
-  -- Явное отключение Wayland-бэкенда для совместимости с Hyprland
   enable_wayland = false,
 
-  -- Настройки шрифтов с приоритетом FiraCode Nerd Font и правильным fallback
   font = wezterm.font_with_fallback({
-    'FiraCode Nerd Font Mono',  -- Основной моноширинный шрифт
-    'Noto Sans',                -- Основной шрифт для Unicode (включая кириллицу) :cite[9]
-    'Noto Sans Cyrillic',       -- Специфичный для кириллицы (если требуется)
-    'Noto Color Emoji',         -- Для эмодзи
-    'DejaVu Sans Mono',         -- Резервный моноширинный
+    'FiraCode Nerd Font Mono',
+    'Noto Sans',
+    'Noto Color Emoji',
+    'DejaVu Sans Mono',
   }),
   font_size = 12.0,
 
-  -- Дополнительные настройки шрифтов
   font_rules = {
     {
       italic = true,
@@ -22,26 +18,26 @@ return {
     },
   },
   warn_about_missing_glyphs = false,
-  font_shaping = 'Harfbuzz',  -- Использовать современный шейпинг
 
-  -- Автоматическое копирование при выделении
-  selection_automatically_copy_to_clipboard = true,
+  -- FIX: корректное поле
+  font_shaper = 'Harfbuzz',
+  -- при необходимости можно добавить тонкую настройку:
+  -- harfbuzz_features = {"calt=1", "liga=1"},
 
-  -- Настройки мыши
+  -- FIX: удалено несуществующее поле `selection_automatically_copy_to_clipboard`
+  -- Действие копирования уже реализовано в mouse_bindings через CompleteSelection="Clipboard"
+
   mouse_bindings = {
-    -- Выделение текста
     {
       event = { Down = { streak = 1, button = 'Left' } },
       mods = 'NONE',
       action = wezterm.action { SelectTextAtMouseCursor = 'Cell' },
     },
-    -- Завершение выделения (копирование происходит автоматически)
     {
       event = { Up = { streak = 1, button = 'Left' } },
       mods = 'NONE',
       action = wezterm.action { CompleteSelection = 'Clipboard' },
     },
-    -- Вставка по правой кнопке
     {
       event = { Up = { streak = 1, button = 'Right' } },
       mods = 'NONE',
@@ -49,28 +45,14 @@ return {
     },
   },
 
-  -- Клавиатурные сочетания
   keys = {
-    -- Вставка по Ctrl+Shift+V
-    {
-      key = 'v',
-      mods = 'CTRL|SHIFT',
-      action = wezterm.action { PasteFrom = 'Clipboard' },
-    },
-    -- Копирование по Ctrl+Shift+C
-    {
-      key = 'c',
-      mods = 'CTRL|SHIFT',
-      action = wezterm.action { CopyTo = 'ClipboardAndPrimarySelection' },
-    },
+    { key = 'v', mods = 'CTRL|SHIFT', action = wezterm.action { PasteFrom = 'Clipboard' } },
+    { key = 'c', mods = 'CTRL|SHIFT', action = wezterm.action { CopyTo = 'ClipboardAndPrimarySelection' } },
   },
 
-  -- Дополнительные настройки
   enable_kitty_keyboard = true,
   hide_mouse_cursor_when_typing = false,
   default_cursor_style = 'BlinkingBlock',
-  
-  -- Настройки для лучшей интеграции с Hyprland
   enable_tab_bar = true,
   use_fancy_tab_bar = false,
   tab_bar_at_bottom = true,

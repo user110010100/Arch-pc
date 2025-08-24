@@ -4,11 +4,12 @@ return {
   enable_wayland = false,
 
   font = wezterm.font_with_fallback({
-    'FiraCode Nerd Font Mono',
-    'Noto Sans',
-    'Noto Color Emoji',
-    'DejaVu Sans Mono',
-  }),
+  'FiraCode Nerd Font Mono',
+  'DejaVu Sans Mono',       -- моноширинный до пропорционального
+  'Noto Sans',              -- пропорциональный fallback (редкие сценарии)
+  'Noto Color Emoji',
+  -- 'Symbols Nerd Font Mono', -- (опционально) если хочется ещё больше nerd-иконок
+}),
   font_size = 12.0,
 
   font_rules = {

@@ -107,7 +107,7 @@ pacman -Syu --noconfirm --needed \
   xdg-desktop-portal xdg-desktop-portal-hyprland \
   firefox wezterm \
   zram-generator snapper \
-  ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
+  ttf-firacode-nerd noto-fonts noto-fonts-emoji noto-fonts-cyrillic ttf-dejavu ttf-nerd-fonts-symbols-mono
 
 # ---------- Пользователь ----------
 if ! id -u "${USERNAME}" >/dev/null 2>&1; then

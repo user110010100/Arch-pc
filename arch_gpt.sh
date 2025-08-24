@@ -1,38 +1,48 @@
 #!/usr/bin/env bash
-# Arch Linux (Btrfs + LUKS), minimal install + Hyprland + ZRAM + Snapper
-# Prompts are in English to avoid TTY charset issues on the live ISO.
+# Arch Linux (Btrfs+LUKS), минимальная установка + Hyprland + ZRAM + Snapper
+# Комментарии на русском для разработчиков; все пользовательские подсказки и вопросы — на английском.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# ----------------------------- USER SETTINGS ----------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Параметры (при необходимости подредактируйте)
+# ────────────────────────────────────────────────────────────────────────────────
 DEFAULT_DISK="/dev/sda"
-ESP_SIZE_G="1G"
-ROOT_SIZE_G="120G"
-HOME_SIZE_G="250G"
+ESP_SIZE_G="1G"            # EFI
+ROOT_SIZE_G="120G"         # root (LUKS)
+HOME_SIZE_G="250G"         # home (LUKS) — оставшееся место останется свободно под VeraCrypt
 HOSTNAME="arch-pc"
 USERNAME="user404"
 USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
-BTRFS_OPTS="noatime,compress=zstd"
-PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus)
 
-# Hyprland config URL (your GitHub)
-HYPRLAND_CONF_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
+# Важно: согласно вашим требованиям к монтированию Btrfs
+BTRFS_OPTS="rw,noatime,compress=zstd,ssd,discard=async,space_cache=v2"
 
+# Пакеты базовой системы
+PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl)
+
+# URLs ваших конфигов
+HYPRLAND_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
+WEZTERM_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/wezterm.lua"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Утилиты
+# ────────────────────────────────────────────────────────────────────────────────
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 fail(){ log "ERROR: $*" >&2; exit 1; }
-require_root(){ [[ $EUID -eq 0 ]] || fail "Run as root."; }
+require_root(){ [[ $EUID -eq 0 ]] || fail "Run this script as root."; }
 
 confirm(){
   local msg="$1" ans
   printf '\n%s\n' "$msg"
   read -r -p 'Type "YES" to continue: ' ans
-  [[ $ans == YES ]] || fail "Aborted by user."
+  [[ $ans == YES ]] || fail "Canceled by user."
 }
 
 cleanup_partial(){
-  log "Cleaning possible previous mounts/mappings..."
+  log "Cleaning up previous mounts/mappings if any..."
   mountpoint -q /mnt/boot  && umount /mnt/boot || true
   mountpoint -q /mnt/home  && umount -R /mnt/home || true
   mountpoint -q /mnt       && umount -R /mnt || true
@@ -44,10 +54,21 @@ cleanup_partial(){
 
 need(){
   local cmd="$1" pkg="$2"
-  command -v "$cmd" >/dev/null 2>&1 || { log "Installing $pkg for missing command $cmd"; pacman -Sy --noconfirm --needed "$pkg"; }
+  command -v "$cmd" >/dev/null 2>&1 || {
+    log "Installing missing tool: $pkg"
+    pacman -Sy --noconfirm --needed "$pkg"
+  }
 }
 
-# ------------------------- CHROOT SCRIPT GENERATOR -----------------------------
+check_internet(){
+  if ! ping -c1 -W2 archlinux.org >/dev/null 2>&1; then
+    fail "No internet connectivity. Please ensure networking is up in Live ISO."
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# chroot-скрипт (настройка системы «изнутри»)
+# ────────────────────────────────────────────────────────────────────────────────
 create_chroot_script(){
   cat > /mnt/root/chroot_setup.sh <<'CHROOT'
 #!/usr/bin/env bash
@@ -55,15 +76,15 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 
-# Read vars supplied by the outer script
-source /root/install-vars
+HOSTNAME="arch-pc"
+USERNAME="user404"
+TIMEZONE="Europe/Amsterdam"
 
-# --- Base system setup ---
-log "Timezone, locales, console"
-ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+# ---------- Базовая конфигурация ----------
+log "Timezone, locale, console"
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc || true
 
-# Enable locales
 sed -i 's/^[[:space:]]*#\?[[:space:]]*en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
 sed -i 's/^[[:space:]]*#\?[[:space:]]*ru_RU\.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen
 locale-gen
@@ -77,7 +98,8 @@ EOF
 
 echo "${HOSTNAME}" > /etc/hostname
 
-log "Install desktop stack (Hyprland) & tooling"
+# ---------- Пакеты GUI/NVIDIA/Wayland ----------
+log "Installing GUI stack (Hyprland), NVIDIA, portals, browser, terminal, snapper & zram-generator"
 pacman -Syu --noconfirm --needed \
   zsh zsh-completions sudo cryptsetup mkinitcpio \
   nvidia nvidia-utils nvidia-settings \
@@ -87,9 +109,9 @@ pacman -Syu --noconfirm --needed \
   zram-generator snapper \
   ttf-nerd-fonts-symbols-mono noto-fonts noto-fonts-emoji ttf-dejavu
 
-# User + sudo
+# ---------- Пользователь ----------
 if ! id -u "${USERNAME}" >/dev/null 2>&1; then
-  useradd -m -G wheel -s "${USER_SHELL}" "${USERNAME}"
+  useradd -m -G wheel -s /usr/bin/zsh "${USERNAME}"
 fi
 echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 
@@ -98,8 +120,8 @@ passwd
 echo "Set password for ${USERNAME}:"
 passwd "${USERNAME}"
 
-# --- NVIDIA KMS + mkinitcpio ---
-log "Configure NVIDIA KMS and mkinitcpio (systemd hooks + btrfs + kms)"
+# ---------- NVIDIA KMS + mkinitcpio ----------
+log "Configuring NVIDIA KMS + mkinitcpio"
 mkdir -p /etc/modprobe.d
 cat >/etc/modprobe.d/nvidia.conf <<'EOF'
 options nvidia-drm modeset=1
@@ -110,9 +132,11 @@ sed -i 's%^BINARIES=.*%BINARIES=(/usr/bin/btrfs)%' /etc/mkinitcpio.conf
 sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
-# --- systemd-boot ---
-log "Install systemd-boot and write loader entries"
+# ---------- systemd-boot ----------
+log "Installing systemd-boot and entry"
 bootctl install
+
+UUID_ROOT=$(blkid -s UUID -o value /dev/sda2 || true)
 
 cat >/boot/loader/loader.conf <<'EOF'
 default arch.conf
@@ -127,36 +151,35 @@ title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options rd.luks.name=${UUID_ROOT_PART}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
+options rd.luks.name=${UUID_ROOT}=root rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1
 EOF
 
-# --- crypttab for HOME (LUKS TRIM) ---
-log "Write /etc/crypttab for HOME"
+# ---------- HOME через crypttab ----------
+log "Writing /etc/crypttab for HOME"
+UUID_HOME=$(blkid -s UUID -o value /dev/sda3 || true)
 cat >/etc/crypttab <<EOF
-home    UUID=${UUID_HOME_PART}    none    luks,discard
+home    UUID=${UUID_HOME}    none    luks,discard
 EOF
 chmod 0600 /etc/crypttab
 
-# Enable NetworkManager and fstrim.timer via wants-symlink (no systemctl in chroot)
-log "Enable NetworkManager and fstrim.timer (via wants symlinks)"
+# ---------- Enable services via symlinks (no systemctl in chroot) ----------
+log "Enabling NetworkManager & fstrim.timer via wanted symlinks"
 mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/timers.target.wants
 ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-user.target.wants/NetworkManager.service
 ln -sf /usr/lib/systemd/system/fstrim.timer        /etc/systemd/system/timers.target.wants/fstrim.timer
 
-# --- ZRAM via zram-generator (no start in chroot!) ---
-log "Configure zram-generator"
+# ---------- ZRAM (zram-generator) ----------
+log "Writing zram-generator config (no service start in chroot)"
 cat >/etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-# Use up to RAM size, but cap it at 16G to avoid over-allocation on large RAM
-zram-fraction = 1.0
-max-zram-size = 16G
+zram-size = 16G
 compression-algorithm = zstd
 swap-priority = 100
 EOF
 systemctl disable --now systemd-swap.service 2>/dev/null || true
 
-# --- Snapper (no DBus calls in chroot) ---
-log "Create minimal Snapper configs for root/home"
+# ---------- Snapper minimal configs + first-boot snapshots ----------
+log "Creating minimal Snapper configs"
 install -d /etc/snapper/configs
 cat >/etc/snapper/configs/root <<'EOF'
 FSTYPE="btrfs"
@@ -171,7 +194,7 @@ TIMELINE_CREATE="no"
 NUMBER_CLEANUP="no"
 EOF
 
-log "Create oneshot service to create baseline snapshots on first boot"
+log "Installing oneshot to create baseline snapshots on first boot"
 cat >/etc/systemd/system/firstboot-snapper.service <<'EOF'
 [Unit]
 Description=Create initial Snapper snapshots (one-time)
@@ -189,26 +212,33 @@ WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/firstboot-snapper.service /etc/systemd/system/multi-user.target.wants/firstboot-snapper.service
 
-# --- Hyprland: pull your config from GitHub ---
-log "Hyprland: create directories and download your config"
-install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/hypr"
-install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" "/home/${USERNAME}/.config/wezterm"
+# ---------- Hyprland & WezTerm конфиги (скачиваем с GitHub с фолбэком) ----------
+log "Preparing Hyprland/WezTerm configs"
+install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" /home/${USERNAME}/.config/hypr
+install -d -m 0700 -o "${USERNAME}" -g "${USERNAME}" /home/${USERNAME}/.config/wezterm
 
-if curl -fsSL "${HYPRLAND_CONF_URL}" -o "/home/${USERNAME}/.config/hypr/hyprland.conf"; then
-  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
+# Hyprland
+if curl -fsSL "https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf" \
+   -o /home/${USERNAME}/.config/hypr/hyprland.conf; then
+  chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/hypr/hyprland.conf
 else
-  # Fallback minimal config if download fails
-  cat >"/home/${USERNAME}/.config/hypr/hyprland.conf" <<'EOF'
+  # Резервный минимальный конфиг
+  cat >/home/${USERNAME}/.config/hypr/hyprland.conf <<'EOF'
 monitor = ,preferred,auto,auto
 $terminal = wezterm
 bind = SUPER, Return, exec, $terminal
 exec-once = firefox
 EOF
-  chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/hypr/hyprland.conf"
+  chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/hypr/hyprland.conf
 fi
 
-# WezTerm config (use XWayland for stability)
-cat >"/home/${USERNAME}/.config/wezterm/wezterm.lua" <<'EOF'
+# WezTerm
+if curl -fsSL "https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/wezterm.lua" \
+   -o /home/${USERNAME}/.config/wezterm/wezterm.lua; then
+  chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/wezterm/wezterm.lua
+else
+  # Резерв: XWayland и базовый шрифт с fallback
+  cat >/home/${USERNAME}/.config/wezterm/wezterm.lua <<'EOF'
 local wezterm = require "wezterm"
 return {
   enable_wayland = false,
@@ -219,18 +249,19 @@ return {
   }),
 }
 EOF
-chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config/wezterm"
+  chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/wezterm/wezterm.lua
+fi
 
-# Autostart Hyprland on tty1 only
-cat >"/home/${USERNAME}/.zprofile" <<'EOF'
+# Автостарт Hyprland при логине на tty1
+cat >/home/${USERNAME}/.zprofile <<'EOF'
 if [ "$(tty)" = "/dev/tty1" ]; then
   exec dbus-run-session Hyprland
 fi
 EOF
-chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.zprofile"
-chmod 0644 "/home/${USERNAME}/.zprofile"
+chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.zprofile
+chmod 0644 /home/${USERNAME}/.zprofile
 
-# Permissions hygiene
+# Приводим права к безопасным
 chmod 0644 /etc/mkinitcpio.conf /boot/loader/loader.conf /boot/loader/entries/arch.conf
 chmod 0600 /etc/crypttab
 
@@ -239,50 +270,54 @@ CHROOT
   chmod +x /mnt/root/chroot_setup.sh
 }
 
-# ------------------------------ MAIN FLOW --------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# Основной сценарий
+# ────────────────────────────────────────────────────────────────────────────────
 main(){
   require_root
-  log "Starting minimal Arch install (Hyprland + ZRAM + Snapper)"
+  check_internet
+
+  log "Welcome to minimal Arch install (Btrfs+LUKS+Hyprland+ZRAM+Snapper)."
   lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
 
-  read -r -p "Default disk is ${DEFAULT_DISK}. Enter another disk path or press Enter: " DISK
+  read -r -p "Target disk (default ${DEFAULT_DISK}), press Enter to accept or type another (e.g. /dev/nvme0n1): " DISK
   DISK="${DISK:-$DEFAULT_DISK}"
-  [[ -b $DISK ]] || fail "Block device $DISK not found."
+  [[ -b $DISK ]] || fail "Block device not found: $DISK"
 
   cleanup_partial
-  confirm "DANGER: Partitions 1..3 on $DISK will be created/destroyed. Continue?"
+  confirm "WARNING: This will DESTROY partitions 1..3 on ${DISK} (EFI, root LUKS, home LUKS). Continue?"
 
   need sgdisk gptfdisk
+  need mkfs.fat dosfstools
 
-  # --- Partitioning (GPT) ---
-  log "Partitioning $DISK (ESP / root-LUKS / home-LUKS; leaving the rest free)"
+  # ---------- Разметка ----------
+  log "Partitioning ${DISK} (GPT: 1=ESP, 2=LUKS root, 3=LUKS home; leave free tail for VeraCrypt)"
   sgdisk --zap-all "$DISK"
   sgdisk --clear    "$DISK"
-  sgdisk -n 1:0:+${ESP_SIZE_G}  -t 1:ef00 "$DISK"   # EFI System
-  sgdisk -n 2:0:+${ROOT_SIZE_G} -t 2:8309 "$DISK"   # Linux LUKS
-  sgdisk -n 3:0:+${HOME_SIZE_G} -t 3:8309 "$DISK"   # Linux LUKS
+  sgdisk -n 1:0:+${ESP_SIZE_G}  -t 1:ef00 "$DISK"
+  sgdisk -n 2:0:+${ROOT_SIZE_G} -t 2:8309 "$DISK"
+  sgdisk -n 3:0:+${HOME_SIZE_G} -t 3:8309 "$DISK"
   sgdisk -p "$DISK"
   partprobe "$DISK" || true
   sleep 1
+
   ESP="${DISK}1"; P2="${DISK}2"; P3="${DISK}3"
 
-  # --- LUKS2 + filesystems ---
-  log "Initialize LUKS2 for root ($P2) and home ($P3)"
+  # ---------- LUKS2 + ФС ----------
+  log "Initializing LUKS2 on ${P2} (root) and ${P3} (home)"
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P2"
-  until cryptsetup open "$P2" root; do echo "Wrong LUKS password for root. Try again."; done
+  until cryptsetup open "$P2" root; do echo "Wrong passphrase for root. Try again."; done
 
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P3"
-  until cryptsetup open "$P3" home; do echo "Wrong LUKS password for home. Try again."; done
+  until cryptsetup open "$P3" home; do echo "Wrong passphrase for home. Try again."; done
 
-  log "Format ESP (FAT32) and Btrfs for root/home"
-  need mkfs.fat dosfstools
+  log "Formatting filesystems"
   mkfs.fat -F32 "$ESP"
   mkfs.btrfs /dev/mapper/root
   mkfs.btrfs /dev/mapper/home
 
-  # --- Btrfs subvolumes ---
-  log "Create Btrfs subvolumes"
-  # ROOT
+  # ---------- Сабволюмы ----------
+  log "Creating Btrfs subvolumes (root)"
   mount /dev/mapper/root /mnt
   btrfs subvolume create /mnt/@
   btrfs subvolume create /mnt/@snapshots
@@ -290,14 +325,15 @@ main(){
   btrfs subvolume create /mnt/@var_tmp
   btrfs subvolume create /mnt/@pkg
   umount /mnt
-  # HOME
+
+  log "Creating Btrfs subvolumes (home)"
   mount /dev/mapper/home /mnt
   btrfs subvolume create /mnt/@home
   btrfs subvolume create /mnt/@home.snapshots
   umount /mnt
 
-  # --- Mounting ---
-  log "Mount subvolumes"
+  # ---------- Монтирование с вашими опциями ----------
+  log "Mounting with: ${BTRFS_OPTS}"
   mount -o ${BTRFS_OPTS},subvol=@ /dev/mapper/root /mnt
   mkdir -p /mnt/.snapshots /mnt/var/log /mnt/var/tmp /mnt/var/cache/pacman/pkg /mnt/home
   mount -o ${BTRFS_OPTS},subvol=@snapshots /dev/mapper/root /mnt/.snapshots
@@ -305,53 +341,40 @@ main(){
   mount -o ${BTRFS_OPTS},subvol=@var_tmp   /dev/mapper/root /mnt/var/tmp
   mount -o ${BTRFS_OPTS},subvol=@pkg       /dev/mapper/root /mnt/var/cache/pacman/pkg
 
-  mount -o ${BTRFS_OPTS},subvol=@home            /dev/mapper/home /mnt/home
+  mount -o ${BTRFS_OPTS},subvol=@home           /dev/mapper/home /mnt/home
   mkdir -p /mnt/home/.snapshots
-  mount -o ${BTRFS_OPTS},subvol=@home.snapshots  /dev/mapper/home /mnt/home/.snapshots
+  mount -o ${BTRFS_OPTS},subvol=@home.snapshots /dev/mapper/home /mnt/home/.snapshots
 
   mkdir -p /mnt/boot
   mount "$ESP" /mnt/boot
 
-  # --- Base system ---
-  log "Install base system (pacstrap)"
+  # ---------- База системы ----------
+  log "Pacstrapping base system"
   pacstrap /mnt "${PACSTRAP_PKGS[@]}"
 
-  log "Generate fstab"
+  log "Generating fstab"
   genfstab -U /mnt >> /mnt/etc/fstab
 
-  # --- Pass variables to chroot ---
-  UUID_ROOT_PART=$(blkid -s UUID -o value "$P2")
-  UUID_HOME_PART=$(blkid -s UUID -o value "$P3")
-  cat > /mnt/root/install-vars <<EOF
-HOSTNAME="${HOSTNAME}"
-USERNAME="${USERNAME}"
-USER_SHELL="${USER_SHELL}"
-TIMEZONE="${TIMEZONE}"
-UUID_ROOT_PART="${UUID_ROOT_PART}"
-UUID_HOME_PART="${UUID_HOME_PART}"
-HYPRLAND_CONF_URL="${HYPRLAND_CONF_URL}"
-EOF
-
-  # --- Chroot phase ---
+  # ---------- chroot-шаг ----------
   create_chroot_script
-  log "Run arch-chroot"
+  log "Running arch-chroot setup"
   arch-chroot /mnt /root/chroot_setup.sh
 
-  # --- Final prompt ---
+  # ---------- Финал ----------
   log "Installation finished."
   echo
-  echo "Reboot into the installed system now?"
-  read -r -p 'Type YES to unmount /mnt, close LUKS mappings and reboot: ' ans
+  echo "Do you want to reboot into the installed system now?"
+  read -r -p 'Type "YES" to unmount, close LUKS, and reboot (anything else to leave mounted): ' ans
   if [[ $ans == YES ]]; then
-    sync
     umount -R /mnt || true
     swapoff -a 2>/dev/null || true
-    for m in root home; do
+    # Закрываем маппинги (на случай если кто-то смонтировал ещё что-то)
+    for m in home root; do
       [[ -e /dev/mapper/$m ]] && cryptsetup close "$m" || true
     done
     reboot
   else
-    log "System remains mounted at /mnt for manual inspection."
+    log "Left mounted at /mnt for manual inspection."
   fi
 }
 

@@ -4,20 +4,25 @@ return {
   -- Явное отключение Wayland-бэкенда для совместимости с Hyprland
   enable_wayland = false,
 
-  -- Настройки шрифтов
-  font = wezterm.font_with_fallback {
-    -- Основной моноширинный шрифт с поддержкой кириллицы
-    'Noto Mono',
-    -- Дополнительные шрифты для символов и эмодзи
+  -- Настройки шрифтов с приоритетом FiraCode Nerd Font
+  font = wezterm.font_with_fallback({
+    'FiraCode Nerd Font',
+    'Noto Sans Cyrillic',
     'Noto Color Emoji',
     'DejaVu Sans Mono',
-    'Symbols Nerd Font Mono',
-  },
+  }),
   font_size = 12.0,
 
-  -- Дополнительные настройки отображения шрифтов
-  freetype_load_flags = 'NO_HINTING',
-  freetype_render_target = 'HorizontalLcd',
+  -- Дополнительные настройки шрифтов
+  font_rules = {
+    {
+      italic = true,
+      font = wezterm.font('FiraCode Nerd Font', {italic = true}),
+    },
+  },
+  warn_about_missing_glyphs = false,
+  font_shaping = 'Harfbuzz',
+
 
   -- Настройки мыши
   mouse_bindings = {

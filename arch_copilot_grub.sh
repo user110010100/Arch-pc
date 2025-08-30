@@ -152,7 +152,7 @@ grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 grub-mkconfig -o /boot/grub/grub.cfg
 
 # Enable grub-btrfs daemon to auto-add snapshot boot entries
-systemctl enable --now grub-btrfsd.service || true
+systemctl enable grub-btrfsd.service || true
 
 log "Writing /etc/crypttab for HOME"
 cat >/etc/crypttab <<EOF
@@ -319,8 +319,6 @@ main(){
   P3="$(partition "$DISK" 3)"
 
   # Получаем UUID для root и home и передаём их в chroot
-  UUID_ROOT="$(blkid -s UUID -o value "$P2" || true)"
-  UUID_HOME="$(blkid -s UUID -o value "$P3" || true)"
 
   log "Initializing LUKS2 on ${P2} (root) and ${P3} (home)"
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P2"
@@ -328,6 +326,10 @@ main(){
 
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P3"
   until cryptsetup open "$P3" home; do echo "Wrong passphrase for home. Try again."; done
+
+  # Capture LUKS UUIDs after formatting/opening (correct values)
+  UUID_ROOT="$(blkid -s UUID -o value "$P2" || true)"
+  UUID_HOME="$(blkid -s UUID -o value "$P3" || true)"
 
   log "Formatting filesystems"
   mkfs.fat -F32 "$ESP"

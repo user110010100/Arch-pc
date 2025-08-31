@@ -17,7 +17,7 @@ USER_SHELL="/usr/bin/zsh"
 TIMEZONE="Europe/Amsterdam"
 
 BTRFS_OPTS="noatime,compress=zstd"
-PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus fontconfig grub efibootmgr os-prober)
+PACSTRAP_PKGS=(base linux linux-firmware btrfs-progs intel-ucode git nano networkmanager curl dbus fontconfig)
 HYPRLAND_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/hyprland.conf"
 WEZTERM_URL="https://raw.githubusercontent.com/user110010100/Arch-pc/refs/heads/main/wezterm.lua"
 
@@ -74,8 +74,6 @@ partition() {
 create_chroot_script(){
   local uuid_root="$1"
   local uuid_home="$2"
-  local luks_mapper_root="$3"
-  local luks_mapper_home="$4"
   cat > /mnt/root/chroot_setup.sh <<CHROOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -87,8 +85,6 @@ USERNAME="${USERNAME}"
 TIMEZONE="${TIMEZONE}"
 UUID_ROOT="${uuid_root}"
 UUID_HOME="${uuid_home}"
-LUKS_MAPPER_ROOT="${luks_mapper_root}"
-LUKS_MAPPER_HOME="${luks_mapper_home}"
 
 log "Timezone, locale, console"
 ln -sf /usr/share/zoneinfo/\${TIMEZONE} /etc/localtime
@@ -115,8 +111,7 @@ pacman -Syu --noconfirm --needed \
   xdg-desktop-portal xdg-desktop-portal-hyprland \
   firefox wezterm \
   zram-generator snapper \
-  ttf-firacode-nerd noto-fonts noto-fonts-emoji noto-fonts-extra ttf-dejavu ttf-nerd-fonts-symbols-mono \
-  grub efibootmgr os-prober
+  ttf-firacode-nerd noto-fonts noto-fonts-emoji noto-fonts-extra ttf-dejavu ttf-nerd-fonts-symbols-mono
 
 if ! id -u "\${USERNAME}" >/dev/null 2>&1; then
   useradd -m -G wheel -s /usr/bin/zsh "\${USERNAME}"
@@ -142,27 +137,33 @@ sed -i 's%^BINARIES=.*%BINARIES=(/usr/bin/btrfs)%' /etc/mkinitcpio.conf
 sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect modconf kms keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
-# ---------- GRUB установка и настройка ----------
-log "Installing GRUB (EFI mode)"
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+  log "Installing GRUB (UEFI) and configuring snapshot support"
+  pacman -S --noconfirm --needed grub efibootmgr grub-btrfs inotify-tools || true
 
-log "Writing /etc/default/grub with cryptdevice options"
-# Формируем параметры для GRUB_CMDLINE_LINUX
-GRUB_CMDLINE="cryptdevice=UUID=\${UUID_ROOT}:root root=/dev/mapper/root rootflags=subvol=@,compress=zstd quiet splash nvidia-drm.modeset=1"
-if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
-  sed -i "s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"\${GRUB_CMDLINE}\"/" /etc/default/grub
-else
-  echo "GRUB_CMDLINE_LINUX=\"\${GRUB_CMDLINE}\"" >> /etc/default/grub
-fi
+  # Write /etc/default/grub safely (no fragile sed)
+  cat >/etc/default/grub <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=2
+GRUB_DISTRIBUTOR="Arch"
+GRUB_CMDLINE_LINUX="rd.luks.name=${UUID_ROOT}=root rd.luks.name=${UUID_HOME}=home rd.luks.options=discard root=/dev/mapper/root rootflags=subvol=@,compress=zstd rw nvidia-drm.modeset=1"
+GRUB_PRELOAD_MODULES="part_gpt part_msdos"
+GRUB_ENABLE_CRYPTODISK=y
+EOF
 
-log "Generating GRUB config"
-grub-mkconfig -o /boot/grub/grub.cfg
+  # Install GRUB to the ESP and generate config
+  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+  grub-mkconfig -o /boot/grub/grub.cfg
+  test -s /boot/grub/grub.cfg || (echo "ERROR: grub.cfg not created!" >&2; exit 1)
 
-# ---------- HOME через crypttab ----------
+  # Enable grub-btrfs daemon (it will start on the next boot)
+  systemctl enable grub-btrfsd.service || true
+
 log "Writing /etc/crypttab for HOME"
 cat >/etc/crypttab <<EOF
 home    UUID=\${UUID_HOME}    none    luks,discard
 EOF
+  # Ensure initramfs also knows to unlock HOME
+  cp /etc/crypttab /etc/crypttab.initramfs
 chmod 0600 /etc/crypttab
 
 log "Enabling NetworkManager & fstrim.timer via wanted symlinks"
@@ -281,7 +282,7 @@ EOF
 chown \${USERNAME}:\${USERNAME} /home/\${USERNAME}/.zprofile
 chmod 0644 /home/\${USERNAME}/.zprofile
 
-chmod 0644 /etc/mkinitcpio.conf /etc/default/grub /boot/grub/grub.cfg
+  chmod 0644 /etc/mkinitcpio.conf /etc/default/grub /boot/grub/grub.cfg
 chmod 0600 /etc/crypttab
 
 log "chroot_setup.sh finished."
@@ -323,11 +324,7 @@ main(){
   P2="$(partition "$DISK" 2)"
   P3="$(partition "$DISK" 3)"
 
-  # Получаем UUID для root и home и их имена mapper
-  UUID_ROOT="$(blkid -s UUID -o value "$P2" || true)"
-  UUID_HOME="$(blkid -s UUID -o value "$P3" || true)"
-  LUKS_MAPPER_ROOT="root"
-  LUKS_MAPPER_HOME="home"
+  # Получаем UUID для root и home и передаём их в chroot
 
   log "Initializing LUKS2 on ${P2} (root) and ${P3} (home)"
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P2"
@@ -335,6 +332,11 @@ main(){
 
   cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 5000 "$P3"
   until cryptsetup open "$P3" home; do echo "Wrong passphrase for home. Try again."; done
+
+  # Capture LUKS UUIDs after formatting/opening (correct values)
+  UUID_ROOT="$(blkid -s UUID -o value "$P2" || true)"
+  UUID_HOME="$(blkid -s UUID -o value "$P3" || true)"
+
 
   log "Formatting filesystems"
   mkfs.fat -F32 "$ESP"
@@ -377,7 +379,7 @@ main(){
   log "Generating fstab"
   genfstab -U /mnt > /mnt/etc/fstab
 
-  create_chroot_script "$UUID_ROOT" "$UUID_HOME" "$LUKS_MAPPER_ROOT" "$LUKS_MAPPER_HOME"
+  create_chroot_script "$UUID_ROOT" "$UUID_HOME"
   log "Running arch-chroot setup"
   arch-chroot /mnt /root/chroot_setup.sh
 
